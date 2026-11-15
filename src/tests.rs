@@ -519,3 +519,78 @@ fn mouse_click_expands_steps_and_live_thinking() {
     let rows = render_rows(&mut app);
     assert!(rows.join("\n").contains("live-thought-line-1"));
 }
+
+#[test]
+fn help_modal_expands_and_wraps_without_clipping() {
+    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let profile = ResolvedAgentProfile {
+        id: "mock".into(),
+        command: "python3".into(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        available: true,
+        default_options_json: None,
+        mcp_servers: Vec::new(),
+    };
+    let (acp_tx, _acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(AppInit {
+        acp_json_path: std::path::PathBuf::from("acp.json"),
+        store: AppStateStore::new(),
+        prefs: SavedPrefs::default(),
+        theme: Theme::opencode_dark(),
+        profiles: vec![profile.clone()],
+        profile,
+        cwd,
+        add_dirs: Vec::new(),
+        cli_mode: None,
+        cli_model: None,
+        initial_prompt: None,
+        auto_approve: false,
+        acp_tx,
+        msg_tx,
+    });
+
+    let render_screen = |app: &mut App, w: u16, h: u16| -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render::draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    app.handle_key(key(KeyCode::F(1)));
+
+    // Wide terminal: expands so all descriptions and groups fit without clipping or scrolling.
+    let wide = render_screen(&mut app, 140, 50);
+    assert!(wide.contains("Send the message (steer or queue while the agent works)"));
+    assert!(wide.contains("Delete word back · word forward · to line start · to line end"));
+    assert!(wide.contains("Slash commands (agent + TUI); /model, /mode, /thinking, /agent, /theme complete values"));
+    assert!(wide.contains("Interrupt the running turn (esc esc clears the input)"));
+    assert!(wide.contains("Clear input · interrupt · press twice to quit"));
+    assert!(wide.contains("Quit (empty input)"));
+
+    // Narrower terminal: wraps descriptions cleanly instead of clipping, and clamps scroll.
+    let narrow_top = render_screen(&mut app, 80, 35);
+    assert!(narrow_top.contains("complete values"));
+    assert!(narrow_top.contains("to line end"));
+    assert!(narrow_top.contains("while the agent works)"));
+
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::PageDown));
+    }
+    let narrow_bottom = render_screen(&mut app, 80, 35);
+    assert!(narrow_bottom.contains("Quit (empty input)"));
+    let clamped_scroll = match &app.modal {
+        Some(ActiveModal::Help(h)) => h.scroll,
+        other => panic!("expected help modal, got {other:?}"),
+    };
+    assert!(clamped_scroll > 0 && clamped_scroll < 50);
+}

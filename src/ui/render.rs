@@ -1891,78 +1891,182 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
             }
             render(f, Paragraph::new(lines), inner);
         }
-        Some(ActiveModal::Help(h)) => {
-            let r = centered(area, 78, 34);
-            render(f, Clear, r);
-            let block = modal_block("Keyboard shortcuts", "↑↓ scroll · esc close", &t);
-            let inner = block.inner(r);
-            render(f, block, r);
-            let lines = help_lines(&t);
-            let visible: Vec<Line<'static>> = lines.into_iter().skip(h.scroll).collect();
-            render(f, Paragraph::new(visible), inner);
-        }
+        Some(ActiveModal::Help(_)) => draw_help(f, app, area),
         None => {}
     }
 }
 
-fn help_lines(t: &Theme) -> Vec<Line<'static>> {
-    let groups: &[(&str, &[(&str, &str)])] = &[
-        ("Composer", &[
-            ("enter", "Send the message (steer or queue while the agent works)"),
-            ("shift+enter · alt+enter · ctrl+j", "New line (or end the line with \\)"),
-            ("↑ / ↓", "Prompt history · edit the last queued message"),
-            ("ctrl+a / ctrl+e", "Start / end of the line"),
-            ("ctrl+← / ctrl+→ · alt+b / alt+f", "Previous / next word"),
-            ("ctrl+w · alt+d · ctrl+u · ctrl+k", "Delete word back · word forward · to line start · to line end"),
-            ("ctrl+z", "Undo"),
-            ("ctrl+r", "Search prompt history"),
-            ("/", "Slash commands (agent + TUI); /model, /mode, /thinking, /agent, /theme complete values"),
-            ("@path", "Attach a file (@file:10-20 for a line range)"),
-        ]),
-        ("Agent", &[
-            ("esc", "Interrupt the running turn (esc esc clears the input)"),
-            ("shift+tab", "Cycle the session mode"),
-            ("ctrl+l", "Select the model"),
-            ("ctrl+g", "Switch the ACP agent"),
-            ("ctrl+n", "New session"),
-            ("ctrl+s", "Browse and resume sessions"),
-        ]),
-        ("View", &[
-            ("ctrl+p", "Command palette"),
-            ("click step", "Expand / collapse a tool or thinking step"),
-            ("ctrl+o", "Expand / collapse all tool outputs"),
-            ("ctrl+t", "Expand / collapse all thinking"),
-            ("ctrl+b", "Toggle the sidebar"),
-            ("pgup / pgdn · shift+↑↓ · wheel", "Scroll the conversation"),
-            ("ctrl+home / ctrl+end", "Jump to the top / bottom"),
-            ("F12", "ACP protocol log"),
-        ]),
-        ("Permissions", &[
-            ("1-9 · enter", "Pick an option"),
-            ("y · a · n", "Allow once · always allow · reject"),
-            ("esc", "Reject once"),
-            ("/yolo", "Toggle auto-approve"),
-        ]),
-        ("App", &[
-            ("ctrl+c", "Clear input · interrupt · press twice to quit"),
-            ("ctrl+d", "Quit (empty input)"),
-        ]),
-    ];
+const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    ("Composer", &[
+        ("enter", "Send the message (steer or queue while the agent works)"),
+        ("shift+enter · alt+enter · ctrl+j", "New line (or end the line with \\)"),
+        ("↑ / ↓", "Prompt history · edit the last queued message"),
+        ("ctrl+a / ctrl+e", "Start / end of the line"),
+        ("ctrl+← / ctrl+→ · alt+b / alt+f", "Previous / next word"),
+        ("ctrl+w · alt+d · ctrl+u · ctrl+k", "Delete word back · word forward · to line start · to line end"),
+        ("ctrl+z", "Undo"),
+        ("ctrl+r", "Search prompt history"),
+        ("/", "Slash commands (agent + TUI); /model, /mode, /thinking, /agent, /theme complete values"),
+        ("@path", "Attach a file (@file:10-20 for a line range)"),
+    ]),
+    ("Agent", &[
+        ("esc", "Interrupt the running turn (esc esc clears the input)"),
+        ("shift+tab", "Cycle the session mode"),
+        ("ctrl+l", "Select the model"),
+        ("ctrl+g", "Switch the ACP agent"),
+        ("ctrl+n", "New session"),
+        ("ctrl+s", "Browse and resume sessions"),
+    ]),
+    ("View", &[
+        ("ctrl+p", "Command palette"),
+        ("click step", "Expand / collapse a tool or thinking step"),
+        ("ctrl+o", "Expand / collapse all tool outputs"),
+        ("ctrl+t", "Expand / collapse all thinking"),
+        ("ctrl+b", "Toggle the sidebar"),
+        ("pgup / pgdn · shift+↑↓ · wheel", "Scroll the conversation"),
+        ("ctrl+home / ctrl+end", "Jump to the top / bottom"),
+        ("F12", "ACP protocol log"),
+    ]),
+    ("Permissions", &[
+        ("1-9 · enter", "Pick an option"),
+        ("y · a · n", "Allow once · always allow · reject"),
+        ("esc", "Reject once"),
+        ("/yolo", "Toggle auto-approve"),
+    ]),
+    ("App", &[
+        ("ctrl+c", "Clear input · interrupt · press twice to quit"),
+        ("ctrl+d", "Quit (empty input)"),
+    ]),
+];
+
+fn help_key_col() -> usize {
+    HELP_GROUPS
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|(k, _)| k.width()))
+        .max()
+        .unwrap_or(0)
+        + 2
+}
+
+fn help_ideal_width(key_col: usize) -> u16 {
+    let max_line_w = HELP_GROUPS
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|(_, v)| 3 + key_col + v.width()))
+        .max()
+        .unwrap_or(0);
+    // Reserve space for borders, right breathing room, and an optional scrollbar.
+    (max_line_w + 4).min(u16::MAX as usize) as u16
+}
+
+fn help_lines(content_w: usize, key_col: usize, t: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for (g, items) in groups {
+    let key_style = Style::default().fg(t.accent);
+    let desc_style = Style::default().fg(t.text_muted);
+    let two_col = content_w >= 3 + key_col + 16;
+
+    for (g, items) in HELP_GROUPS {
         lines.push(Line::from(Span::styled(
             format!(" {g}"),
             Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
         )));
         for (k, v) in *items {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {k:<34}"), Style::default().fg(t.accent)),
-                Span::styled((*v).to_string(), Style::default().fg(t.text_muted)),
-            ]));
+            if two_col {
+                let pad = key_col.saturating_sub(k.width());
+                let first = vec![Span::styled(format!("   {k}{}", " ".repeat(pad)), key_style)];
+                let cont = vec![Span::raw(" ".repeat(3 + key_col))];
+                lines.extend(wrap_styled_spans(
+                    vec![Span::styled((*v).to_string(), desc_style)],
+                    content_w,
+                    first,
+                    cont,
+                ));
+            } else {
+                lines.extend(wrap_styled_spans(
+                    vec![Span::styled((*k).to_string(), key_style)],
+                    content_w,
+                    vec![Span::raw("   ")],
+                    vec![Span::raw("   ")],
+                ));
+                lines.extend(wrap_styled_spans(
+                    vec![Span::styled((*v).to_string(), desc_style)],
+                    content_w,
+                    vec![Span::raw("     ")],
+                    vec![Span::raw("     ")],
+                ));
+            }
         }
         lines.push(Line::raw(""));
     }
+    if matches!(lines.last(), Some(l) if l.width() == 0) {
+        lines.pop();
+    }
     lines
+}
+
+fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
+    let t = app.theme.clone();
+    let Some(ActiveModal::Help(h)) = app.modal.as_mut() else {
+        return;
+    };
+
+    let key_col = help_key_col();
+    let ideal_w = help_ideal_width(key_col);
+    let max_h = if area.height > 6 {
+        area.height - 4
+    } else {
+        area.height
+    };
+
+    let probe = centered(area, ideal_w, max_h);
+    let inner_w = probe.width.saturating_sub(2) as usize;
+    let max_inner_h = probe.height.saturating_sub(2) as usize;
+
+    let mut lines = help_lines(inner_w.saturating_sub(1), key_col, &t);
+    if lines.len() > max_inner_h && inner_w > 1 {
+        lines = help_lines(inner_w.saturating_sub(2), key_col, &t);
+    }
+
+    let content_h = (lines.len().min(u16::MAX as usize - 2) as u16).saturating_add(2);
+    let r = centered(area, ideal_w, content_h.min(max_h));
+    let total = lines.len();
+    let ih = r.height.saturating_sub(2) as usize;
+    let hint = if total > ih {
+        "↑↓ scroll · esc close"
+    } else {
+        "esc close"
+    };
+    let block = modal_block("Keyboard shortcuts", hint, &t);
+    let inner = block.inner(r);
+    render(f, Clear, r);
+    render(f, block, r);
+
+    let max_scroll = total.saturating_sub(ih);
+    h.scroll = h.scroll.min(max_scroll);
+
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(h.scroll).take(ih).collect();
+    let text_area = if total > ih && inner.width > 1 {
+        Rect {
+            width: inner.width - 1,
+            ..inner
+        }
+    } else {
+        inner
+    };
+    render(f, Paragraph::new(visible), text_area);
+
+    if total > ih && inner.width > 0 && inner.height > 0 {
+        let mut state = ScrollbarState::new(max_scroll).position(h.scroll);
+        render_stateful(
+            f,
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some(" "))
+                .thumb_style(Style::default().fg(t.border)),
+            inner,
+            &mut state,
+        );
+    }
 }
 
 fn draw_permission(f: &mut Frame, app: &App, area: Rect) {

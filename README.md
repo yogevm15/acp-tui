@@ -196,12 +196,6 @@ Run unit and end-to-end tests (uses `python3` with `tests/fixtures/mock_agent.py
 cargo test
 ```
 
-Inspect raw terminal key sequences (useful for debugging terminal keybindings):
-
-```sh
-cargo run --example keyprobe
-```
-
 ## License
 
 Licensed under the [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) license.
