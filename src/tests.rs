@@ -215,6 +215,9 @@ fn draw_every_view_at_all_sizes(app: &mut App) {
     app.open_config_modal();
     draw_at_all_sizes(app);
     app.modal = None;
+    app.open_rewind_modal();
+    draw_at_all_sizes(app);
+    app.modal = None;
 }
 
 /// Drives the real `App` against `tests/fixtures/mock_agent.py`.
@@ -433,11 +436,19 @@ fn mouse_click_expands_steps_and_live_thinking() {
             })
             .collect()
     };
-    let left_click = |col: u16, row: u16| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: col,
-        row,
-        modifiers: KeyModifiers::NONE,
+    let left_click = |app: &mut App, col: u16, row: u16| {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
     };
 
     // Initial state: finished thoughts, read card, and live thought are all collapsed.
@@ -455,7 +466,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
         .iter()
         .position(|r| r.contains("First finished thought"))
         .unwrap() as u16;
-    app.handle_mouse(left_click(6, t1_row));
+    left_click(&mut app, 6, t1_row);
     let rows = render_rows(&mut app);
     let joined = rows.join("\n");
     assert!(joined.contains("Hidden finished detail alpha"));
@@ -466,7 +477,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
         .iter()
         .position(|r| r.contains("src/cli.rs"))
         .unwrap() as u16;
-    app.handle_mouse(left_click(6, read_row));
+    left_click(&mut app, 6, read_row);
     let rows = render_rows(&mut app);
     let joined = rows.join("\n");
     assert!(joined.contains("read-secret-line-one"));
@@ -477,7 +488,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
         .iter()
         .position(|r| r.contains("src/cli.rs"))
         .unwrap() as u16;
-    app.handle_mouse(left_click(6, read_row));
+    left_click(&mut app, 6, read_row);
     let rows = render_rows(&mut app);
     assert!(!rows.join("\n").contains("read-secret-line-one"));
 
@@ -486,7 +497,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
         .iter()
         .position(|r| r.contains("Thinking…") && r.contains("click to expand"))
         .unwrap() as u16;
-    app.handle_mouse(left_click(6, live_row));
+    left_click(&mut app, 6, live_row);
     let rows = render_rows(&mut app);
     let joined = rows.join("\n");
     assert!(joined.contains("live-thought-line-1"));
@@ -507,7 +518,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
         .iter()
         .position(|r| r.contains("click to collapse"))
         .unwrap() as u16;
-    app.handle_mouse(left_click(6, live_row));
+    left_click(&mut app, 6, live_row);
     let rows = render_rows(&mut app);
     let joined = rows.join("\n");
     assert!(!joined.contains("live-thought-line-1"));
@@ -515,7 +526,7 @@ fn mouse_click_expands_steps_and_live_thinking() {
 
     // Clicking the busy activity bar also toggles the active thinking step.
     let activity_y = app.timeline_hit.activity_rect.y;
-    app.handle_mouse(left_click(4, activity_y));
+    left_click(&mut app, 4, activity_y);
     let rows = render_rows(&mut app);
     assert!(rows.join("\n").contains("live-thought-line-1"));
 }
@@ -593,4 +604,756 @@ fn help_modal_expands_and_wraps_without_clipping() {
         other => panic!("expected help modal, got {other:?}"),
     };
     assert!(clamped_scroll > 0 && clamped_scroll < 50);
+}
+
+fn test_app() -> App {
+    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let profile = ResolvedAgentProfile {
+        id: "mock".into(),
+        command: "python3".into(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        available: true,
+        default_options_json: None,
+        mcp_servers: Vec::new(),
+    };
+    let (acp_tx, _acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx, _msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    App::new(AppInit {
+        acp_json_path: std::path::PathBuf::from("acp.json"),
+        store: AppStateStore::new(),
+        prefs: SavedPrefs::default(),
+        theme: Theme::opencode_dark(),
+        profiles: vec![profile.clone()],
+        profile,
+        cwd,
+        add_dirs: Vec::new(),
+        cli_mode: None,
+        cli_model: None,
+        initial_prompt: None,
+        auto_approve: false,
+        acp_tx,
+        msg_tx,
+    })
+}
+
+#[test]
+fn drag_select_highlights_and_copies_without_collapsing_tools() {
+    use base64::Engine;
+
+    let mut app = test_app();
+    app.expand_tools = true;
+    app.push_item(TimelineItem::AssistantMessage {
+        id: Some("a1".into()),
+        text: "Alpha line one\n\nBeta line two".into(),
+        timestamp: chrono::Local::now(),
+    });
+    app.push_item(TimelineItem::ToolCall(ToolCallCard {
+        tool_call_id: "read-1".into(),
+        title: "src/cli.rs".into(),
+        name: Some("Read".into()),
+        kind: "read".into(),
+        status: "completed".into(),
+        locations: Vec::new(),
+        diffs: Vec::new(),
+        text_outputs: vec!["```\nfirst_tool_line\nsecond_tool_line\n```".into()],
+        terminal_ids: Vec::new(),
+        raw_input: None,
+        raw_output: None,
+        started_at: Instant::now(),
+        duration_ms: Some(5),
+    }));
+
+    let draw_buf = |app: &mut App| -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render::draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let row_text = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    };
+    let find_col = |buf: &ratatui::buffer::Buffer, y: u16, needle: &str| -> u16 {
+        let chars: Vec<char> = needle.chars().collect();
+        (0..=buf.area.width.saturating_sub(chars.len() as u16))
+            .find(|&x| {
+                chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| buf[(x + i as u16, y)].symbol() == c.encode_utf8(&mut [0; 4]))
+            })
+            .unwrap()
+    };
+
+    let buf = draw_buf(&mut app);
+    let alpha_row = (0..buf.area.height)
+        .find(|&y| row_text(&buf, y).contains("Alpha line one"))
+        .unwrap();
+    let alpha_col = find_col(&buf, alpha_row, "Alpha");
+    let beta_row = (0..buf.area.height)
+        .find(|&y| row_text(&buf, y).contains("Beta line two"))
+        .unwrap();
+    let beta_end_col = find_col(&buf, beta_row, "Beta") + 3;
+
+    // Drag across AssistantMessage from "Alpha" down to "Beta".
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: alpha_col,
+        row: alpha_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: beta_end_col,
+        row: beta_row,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    // While dragging, selected cells are highlighted with theme.selection_bg.
+    let mid_buf = draw_buf(&mut app);
+    assert_eq!(mid_buf[(alpha_col, alpha_row)].bg, app.theme.selection_bg);
+    assert_eq!(mid_buf[(beta_end_col, beta_row)].bg, app.theme.selection_bg);
+
+    // Release copies the selected text automatically and keeps the selection highlighted.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: beta_end_col,
+        row: beta_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.selection.is_some());
+    let after_up_buf = draw_buf(&mut app);
+    assert_eq!(after_up_buf[(alpha_col, alpha_row)].bg, app.theme.selection_bg);
+    assert_eq!(after_up_buf[(beta_end_col, beta_row)].bg, app.theme.selection_bg);
+    let b64 = app.pending_osc52.take().expect("selection copied via OSC 52");
+    let copied = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+    assert_eq!(copied, "Alpha line one\n\n  Beta");
+    assert!(app.toasts.iter().any(|t| t.text.contains("Copied")));
+
+    // Ctrl+C while selection is active copies the selection and clears it without touching composer.
+    app.composer.set_text("keep draft");
+    app.handle_key(ctrl('c'));
+    assert!(app.selection.is_none());
+    assert_eq!(app.composer.text(), "keep draft");
+    let b64 = app.pending_osc52.take().expect("ctrl+c copied active selection");
+    let copied = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+    assert_eq!(copied, "Alpha line one\n\n  Beta");
+    app.composer.clear();
+
+    // Drag inside an expanded tool call: copies text WITHOUT collapsing the tool call!
+    let buf2 = draw_buf(&mut app);
+    let tool_row = (0..buf2.area.height)
+        .find(|&y| row_text(&buf2, y).contains("first_tool_line"))
+        .unwrap();
+    let tool_start = find_col(&buf2, tool_row, "first_tool_line");
+    let tool_end = tool_start + "first_tool_line".len() as u16 - 1;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: tool_start,
+        row: tool_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: tool_end,
+        row: tool_row,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: tool_end,
+        row: tool_row,
+        modifiers: KeyModifiers::NONE,
+    });
+
+    let b64 = app.pending_osc52.take().expect("tool text copied");
+    let copied = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+    assert_eq!(copied, "first_tool_line");
+
+    let buf3 = draw_buf(&mut app);
+    assert!(
+        (0..buf3.area.height).any(|y| row_text(&buf3, y).contains("second_tool_line")),
+        "tool call must remain expanded after drag selection"
+    );
+}
+
+#[test]
+fn drag_select_works_in_sidebar_and_modals() {
+    use base64::Engine;
+
+    let mut app = test_app();
+    app.show_sidebar = true;
+
+    let draw_buf = |app: &mut App| -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::render::draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let row_text = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    };
+    let find_col = |buf: &ratatui::buffer::Buffer, y: u16, needle: &str| -> u16 {
+        let chars: Vec<char> = needle.chars().collect();
+        (0..=buf.area.width.saturating_sub(chars.len() as u16))
+            .find(|&x| {
+                chars
+                    .iter()
+                    .enumerate()
+                    .all(|(i, c)| buf[(x + i as u16, y)].symbol() == c.encode_utf8(&mut [0; 4]))
+            })
+            .unwrap()
+    };
+
+    // Select inside the sidebar.
+    let buf = draw_buf(&mut app);
+    let sr = app.timeline_hit.sidebar_rect.unwrap();
+    let y = (sr.y..sr.y + sr.height)
+        .find(|&y| row_text(&buf, y).contains("SESSION"))
+        .unwrap();
+    let x0 = find_col(&buf, y, "SESSION");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x0,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: x0 + 6,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: x0 + 6,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let b64 = app.pending_osc52.take().expect("sidebar text copied");
+    let copied = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+    assert_eq!(copied, "SESSION");
+
+    // Select inside the Help modal.
+    app.handle_key(key(KeyCode::F(1)));
+    let buf = draw_buf(&mut app);
+    let mr = app.timeline_hit.modal_rect.unwrap();
+    let y = (mr.y..mr.y + mr.height)
+        .find(|&y| row_text(&buf, y).contains("Composer"))
+        .unwrap();
+    let x0 = find_col(&buf, y, "Composer");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x0,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: x0 + 7,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: x0 + 7,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    let b64 = app.pending_osc52.take().expect("modal text copied");
+    let copied = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(b64).unwrap()).unwrap();
+    assert_eq!(copied, "Composer");
+}
+
+#[test]
+fn paste_collapses_on_first_paste_and_expands_on_second_paste() {
+    let mut app = test_app();
+
+    // Short single-line paste inserts directly without collapsing.
+    app.handle_paste("hello world".to_string());
+    assert_eq!(app.composer.display_text(), "hello world");
+    assert_eq!(app.composer.text(), "hello world");
+    app.composer.clear();
+
+    // First multiline paste collapses into a compact pill, while `.text()` keeps the full payload.
+    let snippet = "line one\nline two\nline three".to_string();
+    app.handle_paste("please check ".to_string());
+    app.handle_paste(snippet.clone());
+    assert_eq!(app.composer.display_text(), "please check [Pasted ~3 lines]");
+    assert_eq!(app.composer.text(), "please check line one\nline two\nline three");
+    assert_eq!(app.composer.lines.len(), 1);
+
+    // Rendering the composer displays the pill, not the expanded multiline content.
+    let backend = ratatui::backend::TestBackend::new(100, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render::draw(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = buf.content().iter().map(|c| c.symbol()).collect();
+    assert!(screen.contains("[Pasted ~3 lines]"));
+    assert!(!screen.contains("line two"));
+
+    // Second paste of the same snippet expands the pill in place!
+    app.handle_paste(snippet.clone());
+    assert_eq!(app.composer.display_text(), "please check line one\nline two\nline three");
+    assert_eq!(app.composer.text(), "please check line one\nline two\nline three");
+    assert_eq!(app.composer.lines.len(), 3);
+
+    // Ctrl+Z undoes the expansion back to the collapsed pill.
+    app.handle_key(ctrl('z'));
+    assert_eq!(app.composer.display_text(), "please check [Pasted ~3 lines]");
+
+    // Pasting a different multiline snippet inserts a second collapsed pill without expanding the first.
+    let other = "other a\nother b".to_string();
+    app.handle_paste(other.clone());
+    assert_eq!(
+        app.composer.display_text(),
+        "please check [Pasted ~3 lines][Pasted ~2 lines]"
+    );
+    assert_eq!(
+        app.composer.text(),
+        "please check line one\nline two\nline threeother a\nother b"
+    );
+
+    // Backspace deletes a collapsed pill atomically in one keypress.
+    app.handle_key(key(KeyCode::Backspace));
+    assert_eq!(app.composer.display_text(), "please check [Pasted ~3 lines]");
+
+    // Long single-line paste (>150 chars) also collapses on first paste and expands on second.
+    app.composer.take_text();
+    let long_line = "x".repeat(200);
+    app.handle_paste(long_line.clone());
+    assert_eq!(app.composer.display_text(), "[Pasted ~200 chars]");
+    assert_eq!(app.composer.text(), long_line);
+    app.handle_paste(long_line.clone());
+    assert_eq!(app.composer.display_text(), long_line);
+}
+
+#[test]
+fn generation_only_tps_excludes_ttft_and_tool_waits_and_renders_per_task() {
+    use crate::app::compute_turn_tps;
+    use crate::state::TurnGenTracker;
+
+    // Simulate a turn with:
+    // - 1.5s TTFT before first token
+    // - 0.5s generation burst (thought + message)
+    // - 4.0s tool execution & permission wait (paused)
+    // - 1.0s final message generation burst
+    let t0 = Instant::now();
+    let mut tracker = TurnGenTracker::default();
+    let first_tok = t0 + Duration::from_millis(1500);
+    tracker.on_chunk(40, first_tok);
+    tracker.on_chunk(60, first_tok + Duration::from_millis(250));
+    tracker.pause(first_tok + Duration::from_millis(500));
+
+    let after_tool = first_tok + Duration::from_millis(4500);
+    tracker.on_chunk(80, after_tool);
+    tracker.on_chunk(120, after_tool + Duration::from_millis(600));
+    let gen_dur = tracker.finish(after_tool + Duration::from_millis(1000));
+
+    assert_eq!(gen_dur, Duration::from_millis(1500));
+    let usage = Usage {
+        total_tokens: 500,
+        input_tokens: 410,
+        output_tokens: 90,
+        ..Default::default()
+    };
+    let (tps, estimated) = compute_turn_tps(gen_dur, tracker.chunk_count, tracker.streamed_chars, Some(&usage)).unwrap();
+    assert!(!estimated);
+    assert!((tps - 60.0).abs() < 0.01);
+
+    // Without output_tokens in Usage, TPS falls back to ~char/4 estimate.
+    let (est_tps, estimated) = compute_turn_tps(gen_dur, tracker.chunk_count, tracker.streamed_chars, None).unwrap();
+    assert!(estimated);
+    // 300 chars / 4 = 75 tokens over 1.5s = 50.0 tok/s
+    assert!((est_tps - 50.0).abs() < 0.01);
+
+    // Sub-20ms IPC bursts do not produce bogus huge TPS values.
+    assert!(compute_turn_tps(Duration::from_millis(5), 1, 100, Some(&usage)).is_none());
+
+    // End-of-task TurnSummary renders in the timeline and persists across subsequent tasks.
+    let mut app = test_app();
+    app.status = crate::state::ConnectionStatus::Connected;
+    app.push_item(TimelineItem::AssistantMessage {
+        id: Some("a1".into()),
+        text: "First reply".into(),
+        timestamp: chrono::Local::now(),
+    });
+    app.push_item(TimelineItem::TurnSummary {
+        duration_ms: 6500,
+        gen_duration_ms: 1500,
+        output_tokens: Some(90),
+        total_tokens: Some(500),
+        tps: Some(60.0),
+        tps_estimated: false,
+    });
+    app.last_turn_duration = Some(Duration::from_millis(6500));
+    app.last_turn_tps = Some((60.0, false));
+    app.usage.last_turn_usage = Some(usage);
+
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render::draw(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.contains("✓ Done in 6s · 60.0 tok/s (90 out in 1.5s)"));
+    assert!(screen.contains("✓ Done in 6s · 60.0 tok/s · 500 tokens"));
+}
+
+#[test]
+fn undo_and_rewind_restore_files_truncate_timeline_and_edit_prompt() {
+    use crate::acp::client::AcpEvent;
+    use crate::acp::fs_handler::FileWriteRecord;
+    use crate::acp::types::{
+        ContentBlock, ContentChunk, SessionNotification, SessionUpdate, ToolCallContent,
+        ToolCallEvent, ToolCallLocation, ToolCallUpdateEvent,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let existing = dir.path().join("existing.txt");
+    let created = dir.path().join("created.txt");
+    std::fs::write(&existing, "v0\n").unwrap();
+
+    let mut app = test_app();
+    app.cwd = dir.path().to_path_buf();
+    app.status = crate::state::ConnectionStatus::Connected;
+
+    // Turn 0: edits existing.txt via fs/write_text_file
+    app.push_item(TimelineItem::UserMessage {
+        id: "u1".into(),
+        text: "first prompt".into(),
+        attachments: Vec::new(),
+        timestamp: chrono::Local::now(),
+        steered: false,
+    });
+    std::fs::write(&existing, "v1\n").unwrap();
+    app.handle_acp(AcpEvent::FileWritten(FileWriteRecord {
+        path: existing.to_string_lossy().into_owned(),
+        old_text: Some("v0\n".into()),
+        new_text: "v1\n".into(),
+    }));
+    app.push_item(TimelineItem::AssistantMessage {
+        id: Some("a1".into()),
+        text: "First reply".into(),
+        timestamp: chrono::Local::now(),
+    });
+
+    // Turn 1: edits existing.txt via tool call AND creates created.txt
+    app.push_item(TimelineItem::UserMessage {
+        id: "u2".into(),
+        text: "second prompt".into(),
+        attachments: Vec::new(),
+        timestamp: chrono::Local::now(),
+        steered: false,
+    });
+    app.session_id = Some("s1".into());
+    app.apply_session_update(SessionNotification {
+        session_id: "s1".into(),
+        update: SessionUpdate::ToolCall(ToolCallEvent {
+            tool_call_id: "tc-edit".into(),
+            title: "Edit existing.txt".into(),
+            name: Some("Edit".into()),
+            kind: Some("edit".into()),
+            status: Some("pending".into()),
+            content: Vec::new(),
+            locations: vec![ToolCallLocation {
+                path: "existing.txt".into(),
+                line: Some(1),
+            }],
+            raw_input: None,
+            raw_output: None,
+            meta: None,
+        }),
+    });
+    std::fs::write(&existing, "v2\n").unwrap();
+    app.apply_session_update(SessionNotification {
+        session_id: "s1".into(),
+        update: SessionUpdate::ToolCallUpdate(ToolCallUpdateEvent {
+            tool_call_id: "tc-edit".into(),
+            title: None,
+            name: None,
+            kind: None,
+            status: Some("completed".into()),
+            content: Some(vec![ToolCallContent::Diff {
+                path: existing.to_string_lossy().into_owned(),
+                old_text: Some("v1\n".into()),
+                new_text: "v2\n".into(),
+            }]),
+            locations: None,
+            raw_input: None,
+            raw_output: None,
+            meta: None,
+        }),
+    });
+
+    std::fs::write(&created, "brand new\n").unwrap();
+    app.handle_acp(AcpEvent::FileWritten(FileWriteRecord {
+        path: created.to_string_lossy().into_owned(),
+        old_text: None,
+        new_text: "brand new\n".into(),
+    }));
+    app.apply_session_update(SessionNotification {
+        session_id: "s1".into(),
+        update: SessionUpdate::AgentMessageChunk(ContentChunk {
+            content: ContentBlock::text("Second reply"),
+            message_id: Some("a2".into()),
+            meta: None,
+        }),
+    });
+
+    assert_eq!(app.modified_files().len(), 2);
+
+    // `/undo` reverts Turn 1, restores existing.txt to v1, deletes created.txt, and loads prompt into composer.
+    app.composer.set_text("/undo");
+    app.handle_key(key(KeyCode::Enter));
+
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "v1\n");
+    assert!(!created.exists(), "created.txt should be deleted on undo");
+    assert_eq!(app.composer.text(), "second prompt");
+    assert_eq!(app.timeline.len(), 2);
+    assert_eq!(app.modified_files().len(), 1);
+
+    // User edits the undone prompt, sends Turn 1 again, then opens `/rewind`.
+    app.composer.insert_str(" edited");
+    assert_eq!(app.composer.text(), "second prompt edited");
+    let edited_prompt = app.composer.take_text();
+    app.push_item(TimelineItem::UserMessage {
+        id: "u2b".into(),
+        text: edited_prompt,
+        attachments: Vec::new(),
+        timestamp: chrono::Local::now(),
+        steered: false,
+    });
+    std::fs::write(&existing, "v2b\n").unwrap();
+    app.handle_acp(AcpEvent::FileWritten(FileWriteRecord {
+        path: existing.to_string_lossy().into_owned(),
+        old_text: Some("v1\n".into()),
+        new_text: "v2b\n".into(),
+    }));
+    app.push_item(TimelineItem::AssistantMessage {
+        id: Some("a2b".into()),
+        text: "Second reply edited".into(),
+        timestamp: chrono::Local::now(),
+    });
+
+    app.composer.set_text("/rewind");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(app.modal, Some(ActiveModal::Rewind(_))));
+
+    // Modal renders both user turns and file counts.
+    let backend = ratatui::backend::TestBackend::new(100, 28);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| crate::ui::render::draw(f, &mut app)).unwrap();
+    let buf = terminal.backend().buffer();
+    let screen: String = (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.contains("Rewind to message"));
+    assert!(screen.contains("second prompt edited"));
+    assert!(screen.contains("first prompt"));
+
+    // Select the first prompt (2nd row in reverse-chronological list) and press Enter.
+    app.handle_key(key(KeyCode::Down));
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(app.modal.is_none());
+    assert!(app.timeline.is_empty());
+    assert!(app.modified_files().is_empty());
+    assert_eq!(std::fs::read_to_string(&existing).unwrap(), "v0\n");
+    assert_eq!(app.composer.text(), "first prompt");
+
+    // Verify ForkSessionRequest serializes `_meta.jetbrains.air.fork` properly.
+    let req = ForkSessionRequest {
+        session_id: "s1".into(),
+        cwd: "/tmp".into(),
+        additional_directories: Vec::new(),
+        mcp_servers: Vec::new(),
+        meta: Some(serde_json::json!({
+            "jetbrains": { "air": { "fork": { "version": 1, "messageId": "a1" } } }
+        })),
+    };
+    let v = serde_json::to_value(&req).unwrap();
+    assert_eq!(v["_meta"]["jetbrains"]["air"]["fork"]["messageId"], "a1");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rewind_preserves_mode_and_model_and_prefs_persist_across_restarts() {
+    if crate::config::find_binary_in_path("python3").is_none() {
+        return;
+    }
+    let data_dir = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("ACP_TUI_DATA_DIR", data_dir.path()) };
+    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = cwd.join("tests/fixtures/mock_agent.py");
+    let profile = ResolvedAgentProfile {
+        id: "mock".into(),
+        command: "python3".into(),
+        args: vec![script.to_string_lossy().into_owned(), format!("{}/", cwd.display())],
+        env: HashMap::new(),
+        available: true,
+        default_options_json: None,
+        mcp_servers: Vec::new(),
+    };
+
+    async fn pump(
+        app: &mut App,
+        acp_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::acp::client::AcpEvent>,
+        msg_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::app::AppMsg>,
+        until: impl Fn(&App) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !until(app) {
+            assert!(Instant::now() < deadline, "timed out waiting for app state");
+            tokio::select! {
+                biased;
+                Some(ev) = acp_rx.recv() => app.handle_acp(ev),
+                Some(m) = msg_rx.recv() => app.handle_msg(m),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
+    // 1. First run: start with default mode ("code") and model ("m1"), switch to "plan" and "m2".
+    let (acp_tx, mut acp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app1 = App::new(AppInit {
+        acp_json_path: std::path::PathBuf::from("acp.json"),
+        store: AppStateStore::new(),
+        prefs: SavedPrefs::default(),
+        theme: Theme::opencode_dark(),
+        profiles: vec![profile.clone()],
+        profile: profile.clone(),
+        cwd: cwd.clone(),
+        add_dirs: Vec::new(),
+        cli_mode: None,
+        cli_model: None,
+        initial_prompt: None,
+        auto_approve: false,
+        acp_tx,
+        msg_tx,
+    });
+    app1.connect(Some(SessionAction::New));
+    pump(&mut app1, &mut acp_rx, &mut msg_rx, |a| a.session_id.is_some()).await;
+    assert_eq!(app1.current_mode_id().as_deref(), Some("code"));
+    assert_eq!(app1.current_model_id().as_deref(), Some("m1"));
+
+    app1.apply_mode("plan");
+    app1.apply_model("m2");
+    assert_eq!(app1.current_mode_id().as_deref(), Some("plan"));
+    assert_eq!(app1.current_model_id().as_deref(), Some("m2"));
+
+    // Send a prompt, then rewind to it via `/rewind`: mode and model must stay "plan" and "m2"!
+    app1.push_item(TimelineItem::UserMessage {
+        id: "u1".into(),
+        text: "turn one".into(),
+        attachments: Vec::new(),
+        timestamp: chrono::Local::now(),
+        steered: false,
+    });
+    app1.push_item(TimelineItem::AssistantMessage {
+        id: Some("a1".into()),
+        text: "reply one".into(),
+        timestamp: chrono::Local::now(),
+    });
+    app1.session_has_prompt = true;
+
+    app1.composer.set_text("/rewind");
+    app1.handle_key(key(KeyCode::Enter));
+    assert!(matches!(app1.modal, Some(ActiveModal::Rewind(_))));
+    app1.handle_key(key(KeyCode::Enter));
+    pump(&mut app1, &mut acp_rx, &mut msg_rx, |a| !a.opening && a.session_id.is_some()).await;
+    assert_eq!(app1.current_mode_id().as_deref(), Some("plan"), "/rewind must preserve mode");
+    assert_eq!(app1.current_model_id().as_deref(), Some("m2"), "/rewind must preserve model");
+
+    // Also simulate RewindFork returning `modes: None, models: None` — must not clear mode/model.
+    app1.pending_session_overrides = Some(crate::app::SessionOverrides {
+        mode: Some("plan".into()),
+        model: Some("m2".into()),
+        ..Default::default()
+    });
+    app1.handle_msg(crate::app::AppMsg::SessionOpened(crate::app::SessionOpened {
+        kind: crate::app::OpenedKind::Rewound,
+        session_id: "s-fork".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        modes: None,
+        models: None,
+        config_options: Vec::new(),
+        fallback_context: None,
+    }));
+    assert_eq!(app1.current_mode_id().as_deref(), Some("plan"));
+    assert_eq!(app1.current_model_id().as_deref(), Some("m2"));
+
+    if let Some(c) = app1.client.clone() {
+        c.shutdown().await;
+    }
+
+    // 2. Restart CLI with no `--mode`/`--model`: loads saved prefs and keeps "plan" and "m2".
+    let store2 = AppStateStore::new();
+    let prefs2 = store2.load_prefs();
+    assert_eq!(prefs2.last_mode_by_agent.get("mock").map(String::as_str), Some("plan"));
+    assert_eq!(prefs2.last_model_by_agent.get("mock").map(String::as_str), Some("m2"));
+
+    let (acp_tx2, mut acp_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx2, mut msg_rx2) = tokio::sync::mpsc::unbounded_channel();
+    let mut app2 = App::new(AppInit {
+        acp_json_path: std::path::PathBuf::from("acp.json"),
+        store: store2,
+        prefs: prefs2,
+        theme: Theme::opencode_dark(),
+        profiles: vec![profile.clone()],
+        profile: profile.clone(),
+        cwd: cwd.clone(),
+        add_dirs: Vec::new(),
+        cli_mode: None,
+        cli_model: None,
+        initial_prompt: None,
+        auto_approve: false,
+        acp_tx: acp_tx2,
+        msg_tx: msg_tx2,
+    });
+    app2.connect(Some(SessionAction::New));
+    pump(&mut app2, &mut acp_rx2, &mut msg_rx2, |a| a.session_id.is_some()).await;
+    assert_eq!(app2.current_mode_id().as_deref(), Some("plan"), "restarted CLI keeps last mode");
+    assert_eq!(app2.current_model_id().as_deref(), Some("m2"), "restarted CLI keeps last model");
+
+    if let Some(c) = app2.client.clone() {
+        c.shutdown().await;
+    }
+
+    // 3. Explicit `--mode` still overrides saved prefs.
+    let store3 = AppStateStore::new();
+    let prefs3 = store3.load_prefs();
+    let (acp_tx3, mut acp_rx3) = tokio::sync::mpsc::unbounded_channel();
+    let (msg_tx3, mut msg_rx3) = tokio::sync::mpsc::unbounded_channel();
+    let mut app3 = App::new(AppInit {
+        acp_json_path: std::path::PathBuf::from("acp.json"),
+        store: store3,
+        prefs: prefs3,
+        theme: Theme::opencode_dark(),
+        profiles: vec![profile.clone()],
+        profile,
+        cwd,
+        add_dirs: Vec::new(),
+        cli_mode: Some("code".into()),
+        cli_model: None,
+        initial_prompt: None,
+        auto_approve: false,
+        acp_tx: acp_tx3,
+        msg_tx: msg_tx3,
+    });
+    app3.connect(Some(SessionAction::New));
+    pump(&mut app3, &mut acp_rx3, &mut msg_rx3, |a| a.session_id.is_some()).await;
+    assert_eq!(app3.current_mode_id().as_deref(), Some("code"));
+    assert_eq!(app3.current_model_id().as_deref(), Some("m2"));
+
+    if let Some(c) = app3.client.clone() {
+        c.shutdown().await;
+    }
 }

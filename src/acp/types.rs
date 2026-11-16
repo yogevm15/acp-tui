@@ -514,6 +514,8 @@ pub struct ForkSessionRequest {
     pub additional_directories: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub mcp_servers: Vec<McpServer>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

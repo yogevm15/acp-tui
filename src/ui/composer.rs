@@ -1,8 +1,18 @@
 use crate::acp::types::{ContentBlock, EmbeddedResourceContents, PromptCapabilities};
 use base64::Engine;
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const PASTE_TOKEN_BASE: u32 = 0x10_0000;
+const PASTE_TOKEN_MAX: u32 = 0x10_FFFD;
+
+#[derive(Debug, Clone)]
+struct PasteChunk {
+    label: String,
+    content: String,
+}
 
 #[derive(Debug, Clone)]
 struct UndoEntry {
@@ -20,7 +30,9 @@ pub struct Composer {
     undo_stack: Vec<UndoEntry>,
     history: Vec<String>,
     history_index: Option<usize>,
-    draft_before_history: Option<String>,
+    draft_before_history: Option<UndoEntry>,
+    pastes: HashMap<char, PasteChunk>,
+    next_paste_id: u32,
 }
 
 impl Composer {
@@ -33,6 +45,8 @@ impl Composer {
             history,
             history_index: None,
             draft_before_history: None,
+            pastes: HashMap::new(),
+            next_paste_id: 0,
         }
     }
 
@@ -41,7 +55,55 @@ impl Composer {
     }
 
     pub fn text(&self) -> String {
-        self.lines.join("\n")
+        let raw = self.lines.join("\n");
+        if self.pastes.is_empty() {
+            return raw;
+        }
+        let mut out = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            if let Some(p) = self.pastes.get(&ch) {
+                out.push_str(&p.content);
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub fn display_text(&self) -> String {
+        let raw = self.lines.join("\n");
+        if self.pastes.is_empty() {
+            return raw;
+        }
+        let mut out = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            if let Some(p) = self.pastes.get(&ch) {
+                out.push_str(&p.label);
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    pub fn paste_label(&self, ch: char) -> Option<&str> {
+        self.pastes.get(&ch).map(|p| p.label.as_str())
+    }
+
+    fn char_display_width(&self, ch: char) -> usize {
+        if let Some(label) = self.paste_label(ch) {
+            UnicodeWidthStr::width(label)
+        } else {
+            ch.width().unwrap_or(0)
+        }
+    }
+
+    fn visual_width_prefix(&self, line: &str, byte_end: usize) -> usize {
+        line[..byte_end.min(line.len())]
+            .chars()
+            .map(|ch| self.char_display_width(ch))
+            .sum()
     }
 
     pub fn set_text(&mut self, text: &str) {
@@ -62,6 +124,8 @@ impl Composer {
         self.undo_stack.clear();
         self.history_index = None;
         self.draft_before_history = None;
+        self.pastes.clear();
+        self.next_paste_id = 0;
         out
     }
 
@@ -127,6 +191,10 @@ impl Composer {
             return;
         }
         self.push_undo();
+        self.insert_normalized_no_undo(&normalized);
+    }
+
+    fn insert_normalized_no_undo(&mut self, normalized: &str) {
         let parts: Vec<&str> = normalized.split('\n').collect();
         if parts.len() == 1 {
             self.lines[self.row].insert_str(self.col, parts[0]);
@@ -148,6 +216,70 @@ impl Composer {
                 self.lines.insert(self.row, (*part).to_string());
             }
         }
+    }
+
+    fn paste_token_before_cursor(&self) -> Option<char> {
+        if self.col == 0 {
+            return None;
+        }
+        let ch = self.lines[self.row][..self.col].chars().next_back()?;
+        self.pastes.contains_key(&ch).then_some(ch)
+    }
+
+    fn alloc_paste_token(&mut self) -> Option<char> {
+        for _ in 0..=PASTE_TOKEN_MAX - PASTE_TOKEN_BASE {
+            let code = PASTE_TOKEN_BASE + self.next_paste_id;
+            self.next_paste_id = if code >= PASTE_TOKEN_MAX {
+                0
+            } else {
+                self.next_paste_id + 1
+            };
+            if let Some(ch) = char::from_u32(code)
+                && !self.pastes.contains_key(&ch)
+            {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    /// Paste text like OpenCode: collapse multiline/long pastes into an inline `[Pasted ~N lines]`
+    /// pill on first paste, and expand that pill into raw text on the second paste.
+    pub fn paste(&mut self, s: &str) {
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        if let Some(tok) = self.paste_token_before_cursor()
+            && self
+                .pastes
+                .get(&tok)
+                .is_some_and(|p| p.content == normalized)
+        {
+            self.push_undo();
+            let prev = prev_char_boundary(&self.lines[self.row], self.col);
+            self.lines[self.row].drain(prev..self.col);
+            self.col = prev;
+            self.insert_normalized_no_undo(&normalized);
+            return;
+        }
+        if should_collapse_paste(&normalized)
+            && let Some(tok) = self.alloc_paste_token()
+        {
+            let label = paste_label(&normalized);
+            self.pastes.insert(
+                tok,
+                PasteChunk {
+                    label,
+                    content: normalized,
+                },
+            );
+            self.push_undo();
+            self.lines[self.row].insert(self.col, tok);
+            self.col += tok.len_utf8();
+            return;
+        }
+        self.insert_str(&normalized);
     }
 
     pub fn insert_newline(&mut self) {
@@ -287,9 +419,9 @@ impl Composer {
 
     pub fn move_up_or_history(&mut self) {
         if self.row > 0 {
-            let visual_col = UnicodeWidthStr::width(&self.lines[self.row][..self.col]);
+            let visual_col = self.visual_width_prefix(&self.lines[self.row], self.col);
             self.row -= 1;
-            self.col = byte_col_for_visual_width(&self.lines[self.row], visual_col);
+            self.col = self.byte_col_for_visual_width(&self.lines[self.row], visual_col);
             return;
         }
 
@@ -299,7 +431,11 @@ impl Composer {
         }
         let next_idx = match self.history_index {
             None => {
-                self.draft_before_history = Some(self.text());
+                self.draft_before_history = Some(UndoEntry {
+                    lines: self.lines.clone(),
+                    row: self.row,
+                    col: self.col,
+                });
                 self.history.len() - 1
             }
             Some(0) => 0,
@@ -314,9 +450,9 @@ impl Composer {
 
     pub fn move_down_or_history(&mut self) {
         if self.row + 1 < self.lines.len() {
-            let visual_col = UnicodeWidthStr::width(&self.lines[self.row][..self.col]);
+            let visual_col = self.visual_width_prefix(&self.lines[self.row], self.col);
             self.row += 1;
-            self.col = byte_col_for_visual_width(&self.lines[self.row], visual_col);
+            self.col = self.byte_col_for_visual_width(&self.lines[self.row], visual_col);
             return;
         }
 
@@ -329,10 +465,27 @@ impl Composer {
                 self.set_text(&entry);
             } else {
                 self.history_index = None;
-                let draft = self.draft_before_history.take().unwrap_or_default();
-                self.set_text(&draft);
+                if let Some(draft) = self.draft_before_history.take() {
+                    self.lines = draft.lines;
+                    self.row = draft.row.min(self.lines.len().saturating_sub(1));
+                    self.col = draft.col.min(self.lines[self.row].len());
+                } else {
+                    self.set_text("");
+                }
             }
         }
+    }
+
+    fn byte_col_for_visual_width(&self, s: &str, target_w: usize) -> usize {
+        let mut w = 0usize;
+        for (byte_idx, ch) in s.char_indices() {
+            let cw = self.char_display_width(ch);
+            if w + cw > target_w {
+                return byte_idx;
+            }
+            w += cw;
+        }
+        s.len()
     }
 
     /// Returns the active `/command` query when line 0 starts with `/` and cursor is inside the command name.
@@ -392,7 +545,10 @@ impl Composer {
         let line = &self.lines[0];
         let rest = line.strip_prefix('/')?;
         let (cmd, arg) = rest.split_once(' ')?;
-        if cmd.is_empty() || self.col < cmd.len() + 2 {
+        if cmd.is_empty()
+            || self.col < cmd.len() + 2
+            || arg.chars().any(|c| self.pastes.contains_key(&c))
+        {
             return None;
         }
         Some((cmd.to_lowercase(), arg.to_string()))
@@ -420,7 +576,8 @@ impl Composer {
             }
         }
         let query = &prefix[at_pos + 1..];
-        if query.contains(char::is_whitespace) {
+        if query.contains(char::is_whitespace) || query.chars().any(|c| self.pastes.contains_key(&c))
+        {
             return None;
         }
         Some((at_pos, query.to_string()))
@@ -482,16 +639,26 @@ fn word_right_boundary(s: &str, idx: usize) -> usize {
     chars.get(k).map(|(b, _)| idx + *b).unwrap_or(s.len())
 }
 
-fn byte_col_for_visual_width(s: &str, target_w: usize) -> usize {
-    let mut w = 0usize;
-    for (byte_idx, ch) in s.char_indices() {
-        let cw = UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4]));
-        if w + cw > target_w {
-            return byte_idx;
-        }
-        w += cw;
+fn should_collapse_paste(normalized: &str) -> bool {
+    let trimmed = normalized.trim_end_matches('\n');
+    trimmed.contains('\n')
+        || normalized.matches('\n').count() >= 2
+        || normalized.chars().count() > 150
+}
+
+fn paste_label(normalized: &str) -> String {
+    let trimmed = normalized.trim_end_matches('\n');
+    let line_count = if trimmed.is_empty() {
+        normalized.matches('\n').count()
+    } else {
+        trimmed.split('\n').count()
+    };
+    if line_count >= 2 {
+        format!("[Pasted ~{line_count} lines]")
+    } else {
+        let chars = normalized.chars().count();
+        format!("[Pasted ~{chars} chars]")
     }
-    s.len()
 }
 
 // ============================================================================

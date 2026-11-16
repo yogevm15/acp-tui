@@ -98,6 +98,23 @@ async fn run_external(cmd: &ExternalTerminalCommand) -> (bool, String) {
     }
 }
 
+fn emit_osc52(b64: &str) {
+    let mut out = std::io::stdout();
+    if std::env::var_os("TMUX").is_some() {
+        let _ = write!(out, "\x1bPtmux;\x1b\x1b]52;c;{b64}\x07\x1b\\");
+        let _ = write!(out, "\x1b]52;c;{b64}\x07");
+    } else if std::env::var_os("STY").is_some()
+        || std::env::var("TERM").is_ok_and(|t| t.starts_with("screen"))
+    {
+        let _ = write!(out, "\x1bP\x1b]52;c;{b64}\x07\x1b\\");
+    } else if std::env::var("TERM").is_ok_and(|t| t.starts_with("foot")) {
+        let _ = write!(out, "\x1b]52;c;{b64}\x1b\\");
+    } else {
+        let _ = write!(out, "\x1b]52;c;{b64}\x07");
+    }
+    let _ = out.flush();
+}
+
 async fn run_app(mut terminal: Tui, mut app: App, keyboard_enhanced: bool,
     mut acp_rx: mpsc::UnboundedReceiver<acp::client::AcpEvent>,
     mut msg_rx: mpsc::UnboundedReceiver<AppMsg>,
@@ -111,9 +128,7 @@ async fn run_app(mut terminal: Tui, mut app: App, keyboard_enhanced: bool,
             terminal.draw(|f| ui::render::draw(f, &mut app))?;
             app.dirty = false;
             if let Some(b64) = app.pending_osc52.take() {
-                let mut out = std::io::stdout();
-                let _ = write!(out, "\x1b]52;c;{b64}\x07");
-                let _ = out.flush();
+                emit_osc52(&b64);
             }
         }
         if app.should_quit {

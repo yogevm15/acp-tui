@@ -269,6 +269,10 @@ pub struct SavedPrefs {
     pub show_thoughts: Option<bool>,
     pub expand_tools: Option<bool>,
     pub last_agent_id: Option<String>,
+    #[serde(default)]
+    pub last_mode_by_agent: HashMap<String, String>,
+    #[serde(default)]
+    pub last_model_by_agent: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

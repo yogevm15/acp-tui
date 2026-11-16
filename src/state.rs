@@ -7,7 +7,7 @@ use chrono::{DateTime, Local};
 use ratatui::layout::Rect;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -106,6 +106,52 @@ pub enum TimelineItem {
         text: String,
         is_error: bool,
     },
+    TurnSummary {
+        duration_ms: u128,
+        gen_duration_ms: u128,
+        output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+        tps: Option<f64>,
+        tps_estimated: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnGenTracker {
+    pub active_burst_start: Option<Instant>,
+    pub last_chunk_at: Option<Instant>,
+    pub accumulated: Duration,
+    pub chunk_count: usize,
+    pub streamed_chars: usize,
+}
+
+impl TurnGenTracker {
+    pub fn on_chunk(&mut self, chars: usize, now: Instant) {
+        self.streamed_chars = self.streamed_chars.saturating_add(chars);
+        self.chunk_count = self.chunk_count.saturating_add(1);
+        self.last_chunk_at = Some(now);
+        if self.active_burst_start.is_none() {
+            self.active_burst_start = Some(now);
+        }
+    }
+
+    pub fn pause(&mut self, now: Instant) {
+        if let Some(start) = self.active_burst_start.take() {
+            self.accumulated = self
+                .accumulated
+                .saturating_add(now.saturating_duration_since(start));
+        }
+    }
+
+    pub fn pause_at_last_chunk(&mut self, fallback_now: Instant) {
+        let end = self.last_chunk_at.unwrap_or(fallback_now);
+        self.pause(end);
+    }
+
+    pub fn finish(&mut self, now: Instant) -> Duration {
+        self.pause(now);
+        self.accumulated
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +206,8 @@ pub enum PaletteAction {
     NewSession,
     OpenSessions,
     ForkSession,
+    UndoTurn,
+    OpenRewind,
     OpenAgents,
     OpenModels,
     OpenModes,
@@ -297,6 +345,49 @@ pub struct ElicitationModalState {
     pub focused_field: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct RewindEntry {
+    pub timeline_idx: usize,
+    pub text: String,
+    pub timestamp: DateTime<Local>,
+    pub files_affected: usize,
+    pub turns_removed: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RewindModalState {
+    pub query: String,
+    pub entries: Vec<RewindEntry>,
+    pub selected: usize,
+}
+
+impl RewindModalState {
+    pub fn filtered_indices(&self) -> Vec<usize> {
+        let keys: Vec<String> = self.entries.iter().map(|e| e.text.clone()).collect();
+        crate::ui::composer::rank_candidates(&self.query, &keys)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FileRestoreContent {
+    /// Exact full-file content before the edit (`None` = file did not exist before).
+    Exact(Option<String>),
+    /// Fallback when a tool only emitted a diff hunk after execution.
+    ReverseDiff {
+        old_text: Option<String>,
+        new_text: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct FileEditRecord {
+    pub turn_user_idx: usize,
+    pub path: String,
+    pub restore: FileRestoreContent,
+    /// When produced by `fs/write_text_file`, tracks sidebar `file_changes` stats.
+    pub fs_stats: Option<(String, (usize, usize))>,
+}
+
 #[derive(Debug)]
 pub enum ActiveModal {
     CommandPalette {
@@ -306,6 +397,7 @@ pub enum ActiveModal {
     },
     Picker(PickerModalState),
     Sessions(SessionPickerState),
+    Rewind(RewindModalState),
     Config(ConfigModalState),
     Permission(PermissionModalState),
     Elicitation(ElicitationModalState),
@@ -390,6 +482,35 @@ pub fn update_plan_entries(target: &mut Vec<PlanEntry>, entries: Vec<PlanEntry>)
     *target = entries;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TimelinePos {
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum SelectionState {
+    Timeline {
+        anchor: TimelinePos,
+        focus: TimelinePos,
+        moved: bool,
+        pending_toggle: Option<(usize, Option<usize>)>,
+    },
+    Screen {
+        region: Rect,
+        anchor: (u16, u16),
+        focus: (u16, u16),
+        moved: bool,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScreenTextBuffer {
+    pub width: u16,
+    pub height: u16,
+    pub cells: Vec<Option<String>>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TimelineHitSpan {
     pub start_line: usize,
@@ -401,6 +522,10 @@ pub struct TimelineHitSpan {
 #[derive(Debug, Clone, Default)]
 pub struct TimelineHitMap {
     pub view_rect: Rect,
+    pub inner_rect: Rect,
+    pub sidebar_rect: Option<Rect>,
+    pub composer_rect: Option<Rect>,
+    pub modal_rect: Option<Rect>,
     pub activity_rect: Rect,
     pub jump_pill_rect: Option<Rect>,
     pub completion_rect: Option<Rect>,

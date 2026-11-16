@@ -678,12 +678,14 @@ impl AcpClientHandle {
         cwd: &str,
         additional_directories: Vec<String>,
         mcp_servers: Vec<McpServer>,
+        meta: Option<Value>,
     ) -> Result<ForkSessionResponse, RpcError> {
         let req = ForkSessionRequest {
             session_id: session_id.to_string(),
             cwd: cwd.to_string(),
             additional_directories,
             mcp_servers,
+            meta,
         };
         self.request("session/fork", &req).await
     }

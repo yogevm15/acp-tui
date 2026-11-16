@@ -25,6 +25,8 @@ pub const LOCAL_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("sessions", "Browse and resume earlier sessions", None),
     ("resume", "Browse and resume earlier sessions", None),
     ("fork", "Fork the current session", None),
+    ("undo", "Undo the last turn and edit its prompt", None),
+    ("rewind", "Rewind to a previous message to edit it", None),
     ("agent", "Switch the ACP agent", Some("[agent-id]")),
     ("model", "Choose the model", Some("[model]")),
     ("mode", "Choose the session mode", Some("[mode]")),
@@ -50,6 +52,14 @@ pub enum SessionAction {
     Load { session_id: String, cwd: String },
     Resume { session_id: String, cwd: String },
     Fork { session_id: String },
+    RewindFork {
+        session_id: String,
+        message_id: String,
+        fallback_context: Option<String>,
+    },
+    RewindNew {
+        fallback_context: Option<String>,
+    },
     ContinueLast,
 }
 
@@ -59,6 +69,7 @@ pub enum OpenedKind {
     Loaded,
     Resumed,
     Forked,
+    Rewound,
 }
 
 pub struct SessionOpened {
@@ -68,6 +79,7 @@ pub struct SessionOpened {
     pub modes: Option<SessionModeState>,
     pub models: Option<LegacySessionModels>,
     pub config_options: Vec<SessionConfigOption>,
+    pub fallback_context: Option<String>,
 }
 
 pub enum AppMsg {
@@ -104,6 +116,14 @@ pub enum AppMsg {
 }
 
 pub type RenderCacheEntry = (u64, u16, u64, bool, Vec<Line<'static>>, bool);
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionOverrides {
+    pub mode: Option<String>,
+    pub model: Option<String>,
+    pub config_selects: Vec<(String, String)>,
+    pub config_bools: Vec<(String, bool)>,
+}
 
 pub struct App {
     pub theme: Theme,
@@ -150,14 +170,20 @@ pub struct App {
     pub subagents: Vec<SubagentSummary>,
     /// path -> (change source id -> (added, removed))
     pub file_changes: BTreeMap<String, HashMap<String, (usize, usize)>>,
+    pub file_undo_log: Vec<FileEditRecord>,
+    pending_tool_snapshots: HashMap<String, Vec<(String, Option<String>)>>,
     fs_write_counter: u64,
     pub usage: SessionUsageState,
 
     pub busy: bool,
     pub turn_started: Option<Instant>,
     pub last_turn_duration: Option<Duration>,
+    pub turn_gen: TurnGenTracker,
+    pub last_turn_tps: Option<(f64, bool)>,
     pub cancel_requested: bool,
     pub auth_retry_prompt: Option<String>,
+    pub pending_rewind_context: Option<String>,
+    pub pending_session_overrides: Option<SessionOverrides>,
     pub queued: VecDeque<String>,
     pub steering_unsupported: bool,
 
@@ -175,6 +201,10 @@ pub struct App {
     pub scroll_from_bottom: usize,
     pub last_total_lines: usize,
     pub last_timeline_height: usize,
+    pub last_timeline_lines: Vec<String>,
+    pub last_screen_buf: ScreenTextBuffer,
+    pub selection: Option<SelectionState>,
+    pub selection_dragging: bool,
     pub toasts: Vec<ToastMessage>,
     pub show_sidebar: bool,
     pub show_thoughts: bool,
@@ -282,6 +312,7 @@ async fn open_session_task(
                 modes: r.modes,
                 models: r.models,
                 config_options: r.config_options.unwrap_or_default(),
+                fallback_context: None,
             })
         }
         SessionAction::Load { session_id, cwd } => {
@@ -293,6 +324,7 @@ async fn open_session_task(
                 modes: r.modes,
                 models: r.models,
                 config_options: r.config_options.unwrap_or_default(),
+                fallback_context: None,
             })
         }
         SessionAction::Resume { session_id, cwd } => {
@@ -304,10 +336,11 @@ async fn open_session_task(
                 modes: r.modes,
                 models: r.models,
                 config_options: r.config_options.unwrap_or_default(),
+                fallback_context: None,
             })
         }
         SessionAction::Fork { session_id } => {
-            let r = client.fork_session(&session_id, &cwd, dirs, mcp).await?;
+            let r = client.fork_session(&session_id, &cwd, dirs, mcp, None).await?;
             Ok(SessionOpened {
                 kind: OpenedKind::Forked,
                 session_id: r.session_id,
@@ -315,6 +348,47 @@ async fn open_session_task(
                 modes: r.modes,
                 models: r.models,
                 config_options: r.config_options.unwrap_or_default(),
+                fallback_context: None,
+            })
+        }
+        SessionAction::RewindFork {
+            session_id,
+            message_id,
+            ..
+        } => {
+            let fork_meta = serde_json::json!({
+                "jetbrains": {
+                    "air": {
+                        "fork": {
+                            "version": 1,
+                            "messageId": message_id,
+                        }
+                    }
+                }
+            });
+            let r = client
+                .fork_session(&session_id, &cwd, dirs, mcp, Some(fork_meta))
+                .await?;
+            Ok(SessionOpened {
+                kind: OpenedKind::Rewound,
+                session_id: r.session_id,
+                cwd,
+                modes: r.modes,
+                models: r.models,
+                config_options: r.config_options.unwrap_or_default(),
+                fallback_context: None,
+            })
+        }
+        SessionAction::RewindNew { fallback_context } => {
+            let r = client.new_session(&cwd, dirs, mcp, meta).await?;
+            Ok(SessionOpened {
+                kind: OpenedKind::Rewound,
+                session_id: r.session_id,
+                cwd,
+                modes: r.modes,
+                models: r.models,
+                config_options: r.config_options.unwrap_or_default(),
+                fallback_context,
             })
         }
     }
@@ -368,13 +442,19 @@ impl App {
             plan_markdown: None,
             subagents: Vec::new(),
             file_changes: BTreeMap::new(),
+            file_undo_log: Vec::new(),
+            pending_tool_snapshots: HashMap::new(),
             fs_write_counter: 0,
             usage: SessionUsageState::default(),
             busy: false,
             turn_started: None,
             last_turn_duration: None,
+            turn_gen: TurnGenTracker::default(),
+            last_turn_tps: None,
             cancel_requested: false,
             auth_retry_prompt: None,
+            pending_rewind_context: None,
+            pending_session_overrides: None,
             queued: VecDeque::new(),
             steering_unsupported: false,
             composer: Composer::new(history),
@@ -389,6 +469,10 @@ impl App {
             scroll_from_bottom: 0,
             last_total_lines: 0,
             last_timeline_height: 20,
+            last_timeline_lines: Vec::new(),
+            last_screen_buf: ScreenTextBuffer::default(),
+            selection: None,
+            selection_dragging: false,
             toasts: Vec::new(),
             show_sidebar,
             show_thoughts,
@@ -556,6 +640,8 @@ impl App {
         self.item_expanded.clear();
         self.render_cache.clear();
         self.timeline_hit.spans.clear();
+        self.last_timeline_lines.clear();
+        self.clear_selection();
         self.pending_timeline_anchor = None;
         self.tool_index.clear();
         self.terminal_owner.clear();
@@ -567,7 +653,11 @@ impl App {
             self.clear_timeline();
             self.terminals.clear();
             self.file_changes.clear();
+            self.file_undo_log.clear();
         }
+        self.pending_tool_snapshots.clear();
+        self.pending_rewind_context = None;
+        self.pending_session_overrides = None;
         self.session_id = None;
         self.session_title = None;
         self.modes = None;
@@ -580,6 +670,8 @@ impl App {
         self.busy = false;
         self.turn_started = None;
         self.last_turn_duration = None;
+        self.turn_gen = TurnGenTracker::default();
+        self.last_turn_tps = None;
         self.pending_updates.clear();
         self.session_has_prompt = false;
         self.cancel_all_interactions();
@@ -599,11 +691,31 @@ impl App {
             .get("default_config_options")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(m) = self.prefs.last_mode_by_agent.get(&self.profile.id) {
+            defaults["mode"] = Value::String(m.clone());
+        }
+        if let Some(m) = self.prefs.last_model_by_agent.get(&self.profile.id) {
+            defaults["model"] = Value::String(m.clone());
+        }
         if let Some(m) = &self.cli_mode {
             defaults["mode"] = Value::String(m.clone());
         }
         if let Some(m) = &self.cli_model {
             defaults["model"] = Value::String(m.clone());
+        }
+        if let Some(ov) = &self.pending_session_overrides {
+            for (k, v) in &ov.config_selects {
+                defaults[k] = Value::String(v.clone());
+            }
+            for (k, v) in &ov.config_bools {
+                defaults[k] = Value::Bool(*v);
+            }
+            if let Some(m) = &ov.mode {
+                defaults["mode"] = Value::String(m.clone());
+            }
+            if let Some(m) = &ov.model {
+                defaults["model"] = Value::String(m.clone());
+            }
         }
         if defaults.as_object().is_some_and(|o| o.is_empty()) {
             return None;
@@ -699,8 +811,13 @@ impl App {
             let _ = client.cancel(sid);
         }
         let caps = self.caps();
-        let forking = matches!(action, SessionAction::Fork { .. });
-        if !forking {
+        let preserve_timeline = matches!(
+            action,
+            SessionAction::Fork { .. }
+                | SessionAction::RewindFork { .. }
+                | SessionAction::RewindNew { .. }
+        );
+        if !preserve_timeline {
             if let (Some(old), true) = (self.session_id.clone(), caps.supports_close_session()) {
                 let c = client.clone();
                 tokio::spawn(async move {
@@ -709,6 +826,17 @@ impl App {
             }
             self.reset_session_state(true);
         } else {
+            if matches!(
+                action,
+                SessionAction::RewindFork { .. } | SessionAction::RewindNew { .. }
+            ) && let (Some(old), true) = (self.session_id.clone(), caps.supports_close_session())
+                && matches!(action, SessionAction::RewindNew { .. })
+            {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    let _ = c.close_session(&old).await;
+                });
+            }
             self.busy = false;
             self.session_id = None;
         }
@@ -748,23 +876,37 @@ impl App {
         self.opening = false;
         self.status = ConnectionStatus::Connected;
         self.session_id = Some(opened.session_id.clone());
-        self.modes = opened.modes;
-        self.legacy_models = opened.models;
+        match opened.kind {
+            OpenedKind::Forked | OpenedKind::Rewound => {
+                if opened.modes.is_some() {
+                    self.modes = opened.modes;
+                }
+                if opened.models.is_some() {
+                    self.legacy_models = opened.models;
+                }
+            }
+            _ => {
+                self.modes = opened.modes;
+                self.legacy_models = opened.models;
+            }
+        }
         if !opened.config_options.is_empty() {
             self.config_options = opened.config_options;
         }
 
         // Updates that arrived before the response (history replay for `session/load`).
         let buffered = std::mem::take(&mut self.pending_updates);
-        self.replaying = true;
-        for n in buffered {
-            if n.session_id == opened.session_id {
-                self.apply_session_update(n);
-            } else {
-                self.route_foreign_update(n);
+        if opened.kind != OpenedKind::Rewound {
+            self.replaying = true;
+            for n in buffered {
+                if n.session_id == opened.session_id {
+                    self.apply_session_update(n);
+                } else {
+                    self.route_foreign_update(n);
+                }
             }
+            self.replaying = false;
         }
-        self.replaying = false;
 
         match opened.kind {
             OpenedKind::New => {}
@@ -783,6 +925,13 @@ impl App {
                     short_id(&opened.session_id)
                 ));
             }
+            OpenedKind::Rewound => {
+                self.session_has_prompt = self
+                    .timeline
+                    .iter()
+                    .any(|i| matches!(i, TimelineItem::UserMessage { .. }));
+                self.pending_rewind_context = opened.fallback_context;
+            }
         }
         if opened.kind != OpenedKind::New {
             self.store.upsert_session_record(
@@ -793,7 +942,7 @@ impl App {
             );
         }
 
-        self.apply_cli_overrides();
+        self.apply_session_overrides(opened.kind);
 
         if let Some(p) = self.initial_prompt.take() {
             self.send_prompt(p);
@@ -803,14 +952,72 @@ impl App {
         self.dirty = true;
     }
 
-    fn apply_cli_overrides(&mut self) {
-        if let Some(mode) = self.cli_mode.take() {
+    fn apply_session_overrides(&mut self, kind: OpenedKind) {
+        let overrides = self.pending_session_overrides.take();
+        let cli_mode = self.cli_mode.take();
+        let cli_model = self.cli_model.take();
+
+        if kind == OpenedKind::Rewound
+            && let Some(ov) = overrides
+        {
+            if let Some(mode) = ov.mode
+                && self.mode_entries().iter().any(|(id, _, _)| *id == mode)
+                && self.current_mode_id().as_deref() != Some(mode.as_str())
+            {
+                self.apply_mode_inner(&mode, false, false);
+            }
+            if let Some(model) = ov.model
+                && self.current_model_id().as_deref() != Some(model.as_str())
+                && (self.model_entries().iter().any(|(id, _, _)| *id == model)
+                    || self.config_by_category("model").is_some())
+            {
+                self.apply_model_inner(&model, false, false);
+            }
+            let mode_opt_id = self.config_by_category("mode").map(|o| o.id.clone());
+            let model_opt_id = self.config_by_category("model").map(|o| o.id.clone());
+            for (id, val) in ov.config_selects {
+                if mode_opt_id.as_deref() == Some(id.as_str())
+                    || model_opt_id.as_deref() == Some(id.as_str())
+                {
+                    continue;
+                }
+                if self
+                    .config_options
+                    .iter()
+                    .find(|o| o.id == id)
+                    .is_some_and(|o| !o.is_boolean() && o.current_str() != val)
+                {
+                    self.set_config_select_inner(id, val, false);
+                }
+            }
+            for (id, val) in ov.config_bools {
+                if self
+                    .config_options
+                    .iter()
+                    .find(|o| o.id == id)
+                    .is_some_and(|o| o.is_boolean() && o.current_bool() != Some(val))
+                {
+                    self.set_config_bool(id, val);
+                }
+            }
+            return;
+        }
+
+        if let Some(mode) = cli_mode {
             let exists = self.mode_entries().iter().any(|(id, _, _)| *id == mode);
             if exists && self.current_mode_id().as_deref() != Some(mode.as_str()) {
-                self.apply_mode(&mode);
+                self.apply_mode_inner(&mode, true, true);
+            }
+        } else if kind == OpenedKind::New
+            && let Some(mode) = self.prefs.last_mode_by_agent.get(&self.profile.id).cloned()
+        {
+            let exists = self.mode_entries().iter().any(|(id, _, _)| *id == mode);
+            if exists && self.current_mode_id().as_deref() != Some(mode.as_str()) {
+                self.apply_mode_inner(&mode, false, false);
             }
         }
-        if let Some(model) = self.cli_model.take() {
+
+        if let Some(model) = cli_model {
             let entries = self.model_entries();
             if let Some((id, _, _)) = entries
                 .iter()
@@ -818,7 +1025,14 @@ impl App {
                 .cloned()
                 && self.current_model_id().as_deref() != Some(id.as_str())
             {
-                self.apply_model(&id);
+                self.apply_model_inner(&id, true, true);
+            }
+        } else if kind == OpenedKind::New
+            && let Some(model) = self.prefs.last_model_by_agent.get(&self.profile.id).cloned()
+        {
+            let exists = self.model_entries().iter().any(|(id, _, _)| *id == model);
+            if exists && self.current_model_id().as_deref() != Some(model.as_str()) {
+                self.apply_model_inner(&model, false, false);
             }
         }
     }
@@ -930,7 +1144,40 @@ impl App {
         }
     }
 
+    fn save_last_mode(&mut self, mode_id: &str) {
+        let key = &self.profile.id;
+        if self.prefs.last_mode_by_agent.get(key).map(String::as_str) == Some(mode_id) {
+            return;
+        }
+        self.prefs
+            .last_mode_by_agent
+            .insert(key.clone(), mode_id.to_string());
+        self.store.save_prefs(&self.prefs);
+    }
+
+    fn save_last_model(&mut self, model_id: &str) {
+        let key = &self.profile.id;
+        if self.prefs.last_model_by_agent.get(key).map(String::as_str) == Some(model_id) {
+            return;
+        }
+        self.prefs
+            .last_model_by_agent
+            .insert(key.clone(), model_id.to_string());
+        self.store.save_prefs(&self.prefs);
+    }
+
     pub fn set_config_select(&mut self, config_id: String, value: String) {
+        self.set_config_select_inner(config_id, value, true);
+    }
+
+    fn set_config_select_inner(&mut self, config_id: String, value: String, save_pref: bool) {
+        if save_pref {
+            if self.config_by_category("mode").is_some_and(|o| o.id == config_id) {
+                self.save_last_mode(&value);
+            } else if self.config_by_category("model").is_some_and(|o| o.id == config_id) {
+                self.save_last_model(&value);
+            }
+        }
         let (Some(client), Some(sid)) = (self.client.clone(), self.session_id.clone()) else {
             return;
         };
@@ -967,13 +1214,20 @@ impl App {
     }
 
     pub fn apply_mode(&mut self, mode_id: &str) {
+        self.apply_mode_inner(mode_id, true, true);
+    }
+
+    fn apply_mode_inner(&mut self, mode_id: &str, show_toast: bool, save_pref: bool) {
         if let Some(opt) = self
             .config_by_category("mode")
             .filter(|o| !o.is_boolean())
             .cloned()
         {
-            self.set_config_select(opt.id, mode_id.to_string());
+            self.set_config_select_inner(opt.id, mode_id.to_string(), save_pref);
         } else if self.modes.is_some() {
+            if save_pref {
+                self.save_last_mode(mode_id);
+            }
             let (Some(client), Some(sid)) = (self.client.clone(), self.session_id.clone()) else {
                 return;
             };
@@ -988,31 +1242,42 @@ impl App {
                 }
             });
         } else {
-            self.toast("This agent does not expose modes", true);
+            if show_toast {
+                self.toast("This agent does not expose modes", true);
+            }
             return;
         }
-        let name = self
-            .mode_entries()
-            .into_iter()
-            .find(|(id, _, _)| id == mode_id)
-            .map(|(_, n, _)| n)
-            .unwrap_or_else(|| mode_id.to_string());
-        let lower = mode_id.to_lowercase();
-        if lower.contains("yolo") || lower.contains("bypass") {
-            self.toast(format!("Mode → {name} (tools run without review)"), false);
-        } else {
-            self.toast(format!("Mode → {name}"), false);
+        if show_toast {
+            let name = self
+                .mode_entries()
+                .into_iter()
+                .find(|(id, _, _)| id == mode_id)
+                .map(|(_, n, _)| n)
+                .unwrap_or_else(|| mode_id.to_string());
+            let lower = mode_id.to_lowercase();
+            if lower.contains("yolo") || lower.contains("bypass") {
+                self.toast(format!("Mode → {name} (tools run without review)"), false);
+            } else {
+                self.toast(format!("Mode → {name}"), false);
+            }
         }
     }
 
     pub fn apply_model(&mut self, model_id: &str) {
+        self.apply_model_inner(model_id, true, true);
+    }
+
+    fn apply_model_inner(&mut self, model_id: &str, show_toast: bool, save_pref: bool) {
         if let Some(opt) = self
             .config_by_category("model")
             .filter(|o| !o.is_boolean())
             .cloned()
         {
-            self.set_config_select(opt.id, model_id.to_string());
+            self.set_config_select_inner(opt.id, model_id.to_string(), save_pref);
         } else if self.legacy_models.is_some() {
+            if save_pref {
+                self.save_last_model(model_id);
+            }
             let (Some(client), Some(sid)) = (self.client.clone(), self.session_id.clone()) else {
                 return;
             };
@@ -1027,16 +1292,20 @@ impl App {
                 }
             });
         } else {
-            self.toast("This agent does not expose model selection", true);
+            if show_toast {
+                self.toast("This agent does not expose model selection", true);
+            }
             return;
         }
-        let name = self
-            .model_entries()
-            .into_iter()
-            .find(|(id, _, _)| id == model_id)
-            .map(|(_, n, _)| n)
-            .unwrap_or_else(|| model_id.to_string());
-        self.toast(format!("Model → {name}"), false);
+        if show_toast {
+            let name = self
+                .model_entries()
+                .into_iter()
+                .find(|(id, _, _)| id == model_id)
+                .map(|(_, n, _)| n)
+                .unwrap_or_else(|| model_id.to_string());
+            self.toast(format!("Model → {name}"), false);
+        }
     }
 
     pub fn cycle_mode(&mut self) {
@@ -1100,6 +1369,23 @@ impl App {
                     self.pending_action = Some(action);
                     self.error("The agent requires authentication.");
                     self.open_auth_picker();
+                    return;
+                }
+                if matches!(
+                    action,
+                    SessionAction::RewindFork { .. }
+                ) {
+                    if let SessionAction::RewindFork { fallback_context, .. } = action {
+                        self.open_session(SessionAction::RewindNew { fallback_context });
+                    }
+                    return;
+                }
+                if matches!(action, SessionAction::RewindNew { .. }) {
+                    self.pending_session_overrides = None;
+                    if let SessionAction::RewindNew { fallback_context } = action {
+                        self.pending_rewind_context = fallback_context;
+                    }
+                    self.toast("Could not reset agent session; rewound locally", true);
                     return;
                 }
                 self.error(format!("Could not open the session: {}", error.message));
@@ -1167,6 +1453,14 @@ impl App {
             AppMsg::ConfigOptions(opts) => {
                 if !opts.is_empty() {
                     self.config_options = opts;
+                    if !self.replaying && !self.opening {
+                        if let Some(m) = self.current_mode_id() {
+                            self.save_last_mode(&m);
+                        }
+                        if let Some(m) = self.current_model_id() {
+                            self.save_last_model(&m);
+                        }
+                    }
                 }
             }
             AppMsg::AuthDone(result) => match result {
@@ -1205,16 +1499,28 @@ impl App {
 
     fn on_prompt_done(&mut self, result: Result<PromptResponse, RpcError>) {
         self.busy = false;
-        self.last_turn_duration = self.turn_started.take().map(|t| t.elapsed());
+        let now = Instant::now();
+        let turn_duration = self
+            .turn_started
+            .take()
+            .map(|t| now.saturating_duration_since(t));
+        self.last_turn_duration = turn_duration;
+        let gen_duration = self.turn_gen.finish(now);
+        let chunk_count = self.turn_gen.chunk_count;
+        let streamed_chars = self.turn_gen.streamed_chars;
         let cancelled = match &result {
             Ok(r) => r.stop_reason == "cancelled",
             Err(_) => self.cancel_requested,
         };
+        let mut turn_usage: Option<Usage> = None;
+        let mut had_ok = false;
         match result {
             Ok(resp) => {
+                had_ok = true;
                 if let Some(u) = resp.usage {
                     self.usage.cumulative_tokens += u.total_tokens;
-                    self.usage.last_turn_usage = Some(u);
+                    self.usage.last_turn_usage = Some(u.clone());
+                    turn_usage = Some(u);
                 }
                 match resp.stop_reason.as_str() {
                     "end_turn" => {}
@@ -1241,6 +1547,33 @@ impl App {
                 } else {
                     self.info("Interrupted by user");
                 }
+            }
+        }
+        let tps = compute_turn_tps(gen_duration, chunk_count, streamed_chars, turn_usage.as_ref());
+        self.last_turn_tps = tps;
+        let output_tokens = turn_usage
+            .as_ref()
+            .map(|u| u.output_tokens)
+            .filter(|&t| t > 0);
+        let total_tokens = turn_usage
+            .as_ref()
+            .map(|u| u.total_tokens)
+            .filter(|&t| t > 0);
+        if had_ok && (!cancelled || tps.is_some()) {
+            let duration_ms = turn_duration.map(|d| d.as_millis()).unwrap_or(0);
+            if tps.is_some()
+                || output_tokens.is_some()
+                || total_tokens.is_some()
+                || duration_ms >= 500
+            {
+                self.push_item(TimelineItem::TurnSummary {
+                    duration_ms,
+                    gen_duration_ms: gen_duration.as_millis(),
+                    output_tokens,
+                    total_tokens,
+                    tps: tps.map(|(rate, _)| rate),
+                    tps_estimated: tps.is_some_and(|(_, est)| est),
+                });
             }
         }
         if cancelled {
@@ -1313,7 +1646,17 @@ impl App {
                 self.file_changes
                     .entry(rec.path.clone())
                     .or_default()
-                    .insert(key, stats);
+                    .insert(key.clone(), stats);
+                if !self.replaying
+                    && let Some(turn_user_idx) = self.current_turn_user_idx()
+                {
+                    self.file_undo_log.push(FileEditRecord {
+                        turn_user_idx,
+                        path: rec.path,
+                        restore: FileRestoreContent::Exact(rec.old_text),
+                        fs_stats: Some((key, stats)),
+                    });
+                }
             }
             AcpEvent::ExtNotification { method, params } => {
                 if method.ends_with("update_todos")
@@ -1427,6 +1770,9 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
+                if self.busy && !self.replaying {
+                    self.turn_gen.on_chunk(text.chars().count(), Instant::now());
+                }
                 let last = self.timeline.len().checked_sub(1);
                 let mut appended = false;
                 if let Some(idx) = last
@@ -1451,6 +1797,9 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
+                if self.busy && !self.replaying {
+                    self.turn_gen.on_chunk(text.chars().count(), Instant::now());
+                }
                 let last = self.timeline.len().checked_sub(1);
                 let mut appended = false;
                 if let Some(idx) = last
@@ -1470,6 +1819,18 @@ impl App {
                 }
             }
             SessionUpdate::ToolCall(ev) => {
+                let existed = self.tool_index.contains_key(&ev.tool_call_id);
+                if self.busy && !self.replaying {
+                    let already_done = matches!(
+                        ev.status.as_deref(),
+                        Some("completed" | "failed" | "cancelled")
+                    );
+                    if !existed && already_done {
+                        self.turn_gen.pause_at_last_chunk(Instant::now());
+                    } else {
+                        self.turn_gen.pause(Instant::now());
+                    }
+                }
                 let idx = self.ensure_tool(&ev.tool_call_id);
                 self.apply_tool_fields(
                     idx,
@@ -1536,7 +1897,10 @@ impl App {
                     .iter_mut()
                     .find(|o| o.category.as_deref() == Some("mode") || o.id == "mode")
                 {
-                    opt.current_value = Value::String(current_mode_id);
+                    opt.current_value = Value::String(current_mode_id.clone());
+                }
+                if !self.replaying && !self.opening {
+                    self.save_last_mode(&current_mode_id);
                 }
             }
             SessionUpdate::ConfigOptionUpdate { config_options } => {
@@ -1773,7 +2137,8 @@ impl App {
     ) {
         let mut new_diffs: Vec<(String, Option<String>, String)> = Vec::new();
         let mut new_terminals: Vec<String> = Vec::new();
-        let (tool_id, command_hint) = {
+        let mut snapshot_candidates: Vec<String> = Vec::new();
+        let (tool_id, command_hint, card_status, card_kind) = {
             let TimelineItem::ToolCall(card) = &mut self.timeline[idx] else {
                 return;
             };
@@ -1819,6 +2184,7 @@ impl App {
                             old_text,
                             new_text,
                         } => {
+                            snapshot_candidates.push(path.clone());
                             new_diffs.push((path.clone(), old_text.clone(), new_text.clone()));
                             card.diffs.push(ToolDiffItem {
                                 path,
@@ -1833,6 +2199,9 @@ impl App {
                         ToolCallContent::Unknown => {}
                     }
                 }
+            }
+            for loc in &card.locations {
+                snapshot_candidates.push(loc.path.clone());
             }
             if card.title.is_empty() {
                 card.title = card
@@ -1849,18 +2218,75 @@ impl App {
                 .and_then(|r| r.get("command").and_then(|c| c.as_str()))
                 .map(String::from)
                 .unwrap_or_else(|| card.title.clone());
-            (card.tool_call_id.clone(), cmd)
+            (
+                card.tool_call_id.clone(),
+                cmd,
+                card.status.clone(),
+                card.kind.clone(),
+            )
         };
+
+        if !self.replaying
+            && matches!(card_status.as_str(), "pending" | "in_progress")
+            && matches!(card_kind.as_str(), "edit" | "delete" | "move")
+        {
+            let entry = self
+                .pending_tool_snapshots
+                .entry(tool_id.clone())
+                .or_default();
+            for raw_path in snapshot_candidates {
+                let norm = normalize_fs_path(&raw_path, &self.cwd)
+                    .to_string_lossy()
+                    .into_owned();
+                if !entry.iter().any(|(p, _)| p == &norm) {
+                    let disk = std::fs::read_to_string(&norm).ok();
+                    entry.push((norm, disk));
+                }
+            }
+        }
 
         for tid in new_terminals {
             self.terminal_owner.insert(tid, idx);
         }
+        let turn_user_idx = self.current_turn_user_idx();
         for (path, old, new) in new_diffs {
             let stats = count_diff(old.as_deref(), &new);
+            let norm = normalize_fs_path(&path, &self.cwd)
+                .to_string_lossy()
+                .into_owned();
+            if !self.replaying
+                && let Some(t_idx) = turn_user_idx
+            {
+                let snap = self
+                    .pending_tool_snapshots
+                    .get_mut(&tool_id)
+                    .and_then(|vec| {
+                        vec.iter()
+                            .position(|(p, _)| p == &norm)
+                            .map(|pos| vec.remove(pos).1)
+                    });
+                let restore = match snap {
+                    Some(exact) => FileRestoreContent::Exact(exact),
+                    None if old.is_none() => FileRestoreContent::Exact(None),
+                    None => FileRestoreContent::ReverseDiff {
+                        old_text: old.clone(),
+                        new_text: new.clone(),
+                    },
+                };
+                self.file_undo_log.push(FileEditRecord {
+                    turn_user_idx: t_idx,
+                    path: norm,
+                    restore,
+                    fs_stats: None,
+                });
+            }
             self.file_changes
                 .entry(path)
                 .or_default()
                 .insert(tool_id.clone(), stats);
+        }
+        if matches!(card_status.as_str(), "completed" | "failed" | "cancelled") {
+            self.pending_tool_snapshots.remove(&tool_id);
         }
         if let Some(m) = meta {
             self.apply_terminal_meta(idx, &m, &command_hint);
@@ -1974,11 +2400,17 @@ impl App {
                 return;
             }
         }
+        if self.busy {
+            self.turn_gen.pause(Instant::now());
+        }
         self.permission_queue.push_back(p);
         self.show_next_interaction();
     }
 
     fn on_elicitation_request(&mut self, e: PendingElicitation) {
+        if self.busy {
+            self.turn_gen.pause(Instant::now());
+        }
         self.elicitation_queue.push_back(e);
         self.show_next_interaction();
     }
@@ -2118,7 +2550,12 @@ impl App {
             return;
         };
         let caps = self.caps().prompt_capabilities;
-        let payload = build_prompt_blocks(&text, &self.cwd, &caps);
+        let mut payload = build_prompt_blocks(&text, &self.cwd, &caps);
+        if let Some(ctx) = self.pending_rewind_context.take()
+            && let Some(ContentBlock::Text { text: t }) = payload.blocks.first_mut()
+        {
+            *t = format!("{ctx}\n\n{t}");
+        }
         if !self.session_has_prompt {
             self.session_has_prompt = true;
             if self.session_title.is_none() {
@@ -2141,6 +2578,7 @@ impl App {
         self.busy = true;
         self.cancel_requested = false;
         self.turn_started = Some(Instant::now());
+        self.turn_gen = TurnGenTracker::default();
         self.scroll_from_bottom = 0;
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
@@ -2199,13 +2637,11 @@ impl App {
         }
         self.composer.record_history(&text);
         self.store.save_history(self.composer.history());
-        if self.try_local_command(text.trim()) {
-            self.composer.take_text();
-            self.completion = None;
-            return;
-        }
         self.composer.take_text();
         self.completion = None;
+        if self.try_local_command(text.trim()) {
+            return;
+        }
         if self.opening || self.status == ConnectionStatus::Connecting {
             self.queued.push_back(text);
             self.toast("Queued — sends when the session is ready", false);
@@ -2233,6 +2669,8 @@ impl App {
             "new" => self.open_session(SessionAction::New),
             "sessions" | "resume" => self.open_sessions_modal(),
             "fork" => self.fork_session(),
+            "undo" => self.undo_last_turn(),
+            "rewind" => self.open_rewind_modal(),
             "agent" => {
                 let ids: Vec<(String, String, Option<String>)> = self
                     .profiles
@@ -2337,6 +2775,259 @@ impl App {
         }
     }
 
+    fn current_turn_user_idx(&self) -> Option<usize> {
+        self.timeline
+            .iter()
+            .rposition(|item| matches!(item, TimelineItem::UserMessage { .. }))
+    }
+
+    pub fn undo_last_turn(&mut self) {
+        if self.busy || self.opening {
+            self.toast("Wait for the current turn to finish (Esc to interrupt)", true);
+            return;
+        }
+        let Some(user_idx) = self.current_turn_user_idx() else {
+            self.toast("Nothing to undo", false);
+            return;
+        };
+        self.rewind_to_turn(user_idx);
+    }
+
+    pub fn open_rewind_modal(&mut self) {
+        if self.busy || self.opening {
+            self.toast("Wait for the current turn to finish (Esc to interrupt)", true);
+            return;
+        }
+        let user_indices: Vec<usize> = self
+            .timeline
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| matches!(item, TimelineItem::UserMessage { .. }).then_some(i))
+            .collect();
+        if user_indices.is_empty() {
+            self.toast("No messages to rewind to", false);
+            return;
+        }
+        let total_turns = user_indices.len();
+        let mut entries = Vec::with_capacity(total_turns);
+        for (pos, &idx) in user_indices.iter().enumerate().rev() {
+            let TimelineItem::UserMessage { text, timestamp, .. } = &self.timeline[idx] else {
+                continue;
+            };
+            let mut affected_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for rec in &self.file_undo_log {
+                if rec.turn_user_idx >= idx {
+                    affected_paths.insert(rec.path.as_str());
+                }
+            }
+            entries.push(RewindEntry {
+                timeline_idx: idx,
+                text: text.clone(),
+                timestamp: *timestamp,
+                files_affected: affected_paths.len(),
+                turns_removed: total_turns - pos,
+            });
+        }
+        self.modal = Some(ActiveModal::Rewind(RewindModalState {
+            query: String::new(),
+            entries,
+            selected: 0,
+        }));
+        self.completion = None;
+    }
+
+    pub fn rewind_to_turn(&mut self, user_idx: usize) {
+        if self.busy || self.opening {
+            self.toast("Wait for the current turn to finish (Esc to interrupt)", true);
+            return;
+        }
+        let Some(TimelineItem::UserMessage { text, .. }) = self.timeline.get(user_idx) else {
+            return;
+        };
+        let restored_prompt = text.clone();
+        let turns_removed = self.timeline[user_idx..]
+            .iter()
+            .filter(|i| matches!(i, TimelineItem::UserMessage { .. }))
+            .count();
+
+        let (reverted_files, failed_files) = self.revert_file_edits_from(user_idx);
+        self.pending_tool_snapshots.clear();
+
+        self.timeline.truncate(user_idx);
+        self.item_revs.truncate(user_idx);
+        self.item_expanded.truncate(user_idx);
+        self.render_cache.truncate(user_idx);
+        self.rebuild_derived_timeline_state();
+        self.scroll_from_bottom = 0;
+        self.clear_selection();
+        self.last_turn_duration = None;
+        self.last_turn_tps = None;
+        self.turn_gen = TurnGenTracker::default();
+        self.usage.last_turn_usage = None;
+        self.plan.clear();
+        self.plan_markdown = None;
+        self.session_has_prompt = self
+            .timeline
+            .iter()
+            .any(|i| matches!(i, TimelineItem::UserMessage { .. }));
+        if !self.session_has_prompt {
+            self.session_title = None;
+        }
+
+        self.composer.set_text(&restored_prompt);
+        self.refresh_completion();
+
+        if self.client.is_some() {
+            let mut ov = SessionOverrides {
+                mode: self.current_mode_id(),
+                model: self.current_model_id(),
+                config_selects: Vec::new(),
+                config_bools: Vec::new(),
+            };
+            for opt in &self.config_options {
+                if opt.is_boolean() {
+                    if let Some(b) = opt.current_bool() {
+                        ov.config_bools.push((opt.id.clone(), b));
+                    }
+                } else {
+                    ov.config_selects.push((opt.id.clone(), opt.current_str()));
+                }
+            }
+            self.pending_session_overrides = Some(ov);
+
+            if !self.session_has_prompt {
+                self.pending_rewind_context = None;
+                self.open_session(SessionAction::RewindNew {
+                    fallback_context: None,
+                });
+            } else {
+                let fallback_ctx = build_rewind_context(&self.timeline);
+                let fork_msg_id = self.timeline.iter().rev().find_map(|item| match item {
+                    TimelineItem::AssistantMessage { id: Some(mid), .. } => Some(mid.clone()),
+                    _ => None,
+                });
+                if let (true, Some(sid), Some(mid)) = (
+                    self.caps().supports_fork_session(),
+                    self.session_id.clone(),
+                    fork_msg_id,
+                ) {
+                    self.open_session(SessionAction::RewindFork {
+                        session_id: sid,
+                        message_id: mid,
+                        fallback_context: fallback_ctx,
+                    });
+                } else {
+                    self.open_session(SessionAction::RewindNew {
+                        fallback_context: fallback_ctx,
+                    });
+                }
+            }
+        }
+
+        let turn_word = if turns_removed == 1 { "turn" } else { "turns" };
+        let mut msg = format!("Undid {turns_removed} {turn_word}");
+        if reverted_files > 0 {
+            let file_word = if reverted_files == 1 { "file" } else { "files" };
+            msg.push_str(&format!(" · restored {reverted_files} {file_word}"));
+        }
+        if failed_files > 0 {
+            msg.push_str(&format!(" · {failed_files} could not be restored"));
+        }
+        self.toast(msg, failed_files > 0);
+    }
+
+    fn revert_file_edits_from(&mut self, user_idx: usize) -> (usize, usize) {
+        let split_at = self
+            .file_undo_log
+            .partition_point(|r| r.turn_user_idx < user_idx);
+        let to_revert: Vec<FileEditRecord> = self.file_undo_log.drain(split_at..).collect();
+        let mut restored_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut failed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for rec in to_revert.into_iter().rev() {
+            let path = std::path::PathBuf::from(&rec.path);
+            let ok = match rec.restore {
+                FileRestoreContent::Exact(Some(old_content)) => {
+                    if let Some(parent) = path.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&path, old_content).is_ok()
+                }
+                FileRestoreContent::Exact(None) => {
+                    if path.exists() {
+                        std::fs::remove_file(&path).is_ok()
+                    } else {
+                        true
+                    }
+                }
+                FileRestoreContent::ReverseDiff { old_text, new_text } => {
+                    if let Ok(cur) = std::fs::read_to_string(&path) {
+                        match old_text {
+                            Some(old) => {
+                                if cur == new_text {
+                                    std::fs::write(&path, old).is_ok()
+                                } else if !new_text.is_empty() && cur.matches(&new_text).count() == 1
+                                {
+                                    let patched = cur.replacen(&new_text, &old, 1);
+                                    std::fs::write(&path, patched).is_ok()
+                                } else {
+                                    false
+                                }
+                            }
+                            None => {
+                                if cur == new_text {
+                                    std::fs::remove_file(&path).is_ok()
+                                } else {
+                                    false
+                                }
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if ok {
+                restored_paths.insert(rec.path);
+            } else {
+                failed_paths.insert(rec.path);
+            }
+        }
+        (restored_paths.len(), failed_paths.len())
+    }
+
+    fn rebuild_derived_timeline_state(&mut self) {
+        self.tool_index.clear();
+        self.terminal_owner.clear();
+        self.file_changes.clear();
+        for (idx, item) in self.timeline.iter().enumerate() {
+            if let TimelineItem::ToolCall(card) = item {
+                self.tool_index.insert(card.tool_call_id.clone(), idx);
+                for tid in &card.terminal_ids {
+                    self.terminal_owner.insert(tid.clone(), idx);
+                }
+                for d in &card.diffs {
+                    let stats = count_diff(d.old_text.as_deref(), &d.new_text);
+                    self.file_changes
+                        .entry(d.path.clone())
+                        .or_default()
+                        .insert(card.tool_call_id.clone(), stats);
+                }
+            }
+        }
+        for rec in &self.file_undo_log {
+            if let Some((key, stats)) = &rec.fs_stats {
+                self.file_changes
+                    .entry(rec.path.clone())
+                    .or_default()
+                    .insert(key.clone(), *stats);
+            }
+        }
+    }
+
     pub fn toggle_auto_approve(&mut self) {
         self.auto_approve = !self.auto_approve;
         self.toast(
@@ -2417,16 +3108,21 @@ impl App {
         }
     }
 
+    pub fn copy_to_clipboard(&mut self, text: &str, toast_msg: &str) {
+        self.pending_osc52 = Some(base64::engine::general_purpose::STANDARD.encode(text));
+        #[cfg(not(test))]
+        spawn_system_clipboard_copy(text.to_string());
+        self.toast(toast_msg, false);
+        self.dirty = true;
+    }
+
     pub fn copy_last_reply(&mut self) {
         let last = self.timeline.iter().rev().find_map(|item| match item {
             TimelineItem::AssistantMessage { text, .. } => Some(text.clone()),
             _ => None,
         });
         match last {
-            Some(t) => {
-                self.pending_osc52 = Some(base64::engine::general_purpose::STANDARD.encode(t));
-                self.toast("Copied the last reply to the clipboard", false);
-            }
+            Some(t) => self.copy_to_clipboard(&t, "Copied the last reply to the clipboard"),
             None => self.toast("No reply to copy", true),
         }
     }
@@ -2801,6 +3497,8 @@ impl App {
             pal("new", "New session", "Start a fresh conversation", Some("Ctrl+N"), "Session", PaletteAction::NewSession),
             pal("sessions", "Sessions", "Browse and resume earlier sessions", Some("Ctrl+S"), "Session", PaletteAction::OpenSessions),
             pal("fork", "Fork session", "Branch the current conversation", None, "Session", PaletteAction::ForkSession),
+            pal("undo", "Undo last turn", "Revert last turn and edit its prompt", None, "Session", PaletteAction::UndoTurn),
+            pal("rewind", "Rewind conversation", "Jump back to an earlier prompt to edit it", None, "Session", PaletteAction::OpenRewind),
             pal("agent", "Switch agent", "Choose another ACP agent", Some("Ctrl+G"), "Agent", PaletteAction::OpenAgents),
             pal("model", "Select model", "Change the model", Some("Ctrl+L"), "Agent", PaletteAction::OpenModels),
             pal("mode", "Select mode", "Change the session mode", Some("Shift+Tab"), "Agent", PaletteAction::OpenModes),
@@ -2846,6 +3544,8 @@ impl App {
             PaletteAction::NewSession => self.open_session(SessionAction::New),
             PaletteAction::OpenSessions => self.open_sessions_modal(),
             PaletteAction::ForkSession => self.fork_session(),
+            PaletteAction::UndoTurn => self.undo_last_turn(),
+            PaletteAction::OpenRewind => self.open_rewind_modal(),
             PaletteAction::OpenAgents => self.open_agent_picker(),
             PaletteAction::OpenModels => self.open_model_picker(),
             PaletteAction::OpenModes => self.open_mode_picker(),
@@ -2888,6 +3588,9 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         self.show_sidebar = !self.show_sidebar;
+        if matches!(self.selection, Some(SelectionState::Screen { .. })) {
+            self.clear_selection();
+        }
         self.prefs.show_sidebar = Some(self.show_sidebar);
         self.store.save_prefs(&self.prefs);
     }
@@ -2985,7 +3688,7 @@ impl App {
         self.dirty = true;
         match self.modal.as_mut() {
             None => {
-                self.composer.insert_str(&text);
+                self.composer.paste(&text);
                 self.refresh_completion();
             }
             Some(ActiveModal::CommandPalette { query, selected, .. }) => {
@@ -3000,6 +3703,10 @@ impl App {
                 s.query.push_str(text.trim());
                 s.selected = 0;
             }
+            Some(ActiveModal::Rewind(r)) => {
+                r.query.push_str(text.trim());
+                r.selected = 0;
+            }
             Some(ActiveModal::Elicitation(e)) => {
                 if let Some(f) = e.fields.get_mut(e.focused_field)
                     && matches!(f.kind, ElicitationFieldKind::Text | ElicitationFieldKind::Number { .. })
@@ -3011,18 +3718,81 @@ impl App {
         }
     }
 
+    fn effective_timeline_start(&self) -> usize {
+        self.last_total_lines
+            .saturating_sub(self.last_timeline_height + self.scroll_from_bottom)
+    }
+
+    fn timeline_pos_from_mouse(&self, column: u16, row: u16) -> TimelinePos {
+        let inner = self.timeline_hit.inner_rect;
+        let max_line = self.last_total_lines.saturating_sub(1);
+        let eff_start = self.effective_timeline_start();
+        let row_offset = if inner.height == 0 {
+            0
+        } else {
+            let max_y = inner.y.saturating_add(inner.height).saturating_sub(1);
+            row.clamp(inner.y, max_y).saturating_sub(inner.y) as usize
+        };
+        let line = eff_start.saturating_add(row_offset).min(max_line);
+        let col = column.saturating_sub(inner.x).min(inner.width) as usize;
+        TimelinePos { line, col }
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.dirty = true;
+        }
+        self.selection_dragging = false;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let text = match sel {
+            SelectionState::Timeline { anchor, focus, .. } => {
+                if anchor == focus {
+                    return None;
+                }
+                extract_timeline_selection(&self.last_timeline_lines, *anchor, *focus)
+            }
+            SelectionState::Screen {
+                region,
+                anchor,
+                focus,
+                moved,
+            } => {
+                if !(*moved || anchor != focus) || anchor == focus {
+                    return None;
+                }
+                extract_screen_selection(&self.last_screen_buf, *region, *anchor, *focus)
+            }
+        };
+        (!text.is_empty()).then_some(text)
+    }
+
     pub fn handle_mouse(&mut self, ev: MouseEvent) {
+        let contains = |r: Rect| {
+            ev.column >= r.x
+                && ev.column < r.x.saturating_add(r.width)
+                && ev.row >= r.y
+                && ev.row < r.y.saturating_add(r.height)
+        };
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.clear_selection();
                 if self.modal.is_some() {
+                    if let Some(region) = self.timeline_hit.modal_rect
+                        && contains(region)
+                    {
+                        self.selection = Some(SelectionState::Screen {
+                            region,
+                            anchor: (ev.column, ev.row),
+                            focus: (ev.column, ev.row),
+                            moved: false,
+                        });
+                        self.selection_dragging = true;
+                    }
                     return;
                 }
-                let contains = |r: Rect| {
-                    ev.column >= r.x
-                        && ev.column < r.x.saturating_add(r.width)
-                        && ev.row >= r.y
-                        && ev.row < r.y.saturating_add(r.height)
-                };
                 if self.timeline_hit.completion_rect.is_some_and(contains)
                     || self.timeline_hit.toast_rects.iter().copied().any(contains)
                 {
@@ -3050,22 +3820,175 @@ impl App {
                     }
                     return;
                 }
-                if contains(self.timeline_hit.view_rect)
-                    && let Some(row_offset) = ev.row.checked_sub(self.timeline_hit.inner_y)
-                {
-                    let line_idx = self
-                        .timeline_hit
-                        .visible_start
-                        .saturating_add(row_offset as usize);
-                    if let Some(&span) = self
+                if contains(self.timeline_hit.view_rect) && !self.last_timeline_lines.is_empty() {
+                    let pos = self.timeline_pos_from_mouse(ev.column, ev.row);
+                    let pending_toggle = self
                         .timeline_hit
                         .spans
                         .iter()
-                        .find(|s| line_idx >= s.start_line && line_idx < s.end_line)
-                        && span.expandable
-                    {
-                        self.toggle_item_expanded(span.item_idx, Some(span.start_line));
+                        .find(|s| pos.line >= s.start_line && pos.line < s.end_line)
+                        .filter(|s| s.expandable)
+                        .map(|s| (s.item_idx, Some(s.start_line)));
+                    self.selection = Some(SelectionState::Timeline {
+                        anchor: pos,
+                        focus: pos,
+                        moved: false,
+                        pending_toggle,
+                    });
+                    self.selection_dragging = true;
+                    return;
+                }
+                if let Some(region) = self
+                    .timeline_hit
+                    .sidebar_rect
+                    .filter(|&r| contains(r))
+                    .or_else(|| self.timeline_hit.composer_rect.filter(|&r| contains(r)))
+                {
+                    self.selection = Some(SelectionState::Screen {
+                        region,
+                        anchor: (ev.column, ev.row),
+                        focus: (ev.column, ev.row),
+                        moved: false,
+                    });
+                    self.selection_dragging = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.selection_dragging {
+                    return;
+                }
+                let inner = self.timeline_hit.inner_rect;
+                match self.selection.as_ref() {
+                    Some(SelectionState::Timeline { .. }) => {
+                        if inner.height > 0 {
+                            if ev.row < inner.y {
+                                self.scroll_up((inner.y - ev.row).min(3) as usize);
+                            } else {
+                                let bottom = inner.y.saturating_add(inner.height);
+                                if ev.row >= bottom {
+                                    self.scroll_down(
+                                        (ev.row - bottom.saturating_sub(1)).min(3) as usize,
+                                    );
+                                }
+                            }
+                        }
+                        let pos = self.timeline_pos_from_mouse(ev.column, ev.row);
+                        if let Some(SelectionState::Timeline {
+                            anchor,
+                            focus,
+                            moved,
+                            pending_toggle,
+                        }) = self.selection.as_mut()
+                        {
+                            if pos != *anchor {
+                                *moved = true;
+                                *pending_toggle = None;
+                            }
+                            *focus = pos;
+                            self.dirty = true;
+                        }
                     }
+                    Some(SelectionState::Screen { region, .. }) => {
+                        let region = *region;
+                        let clamped = clamp_to_rect(ev.column, ev.row, region);
+                        if let Some(SelectionState::Screen {
+                            anchor,
+                            focus,
+                            moved,
+                            ..
+                        }) = self.selection.as_mut()
+                        {
+                            if clamped != *anchor {
+                                *moved = true;
+                            }
+                            *focus = clamped;
+                            self.dirty = true;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if !self.selection_dragging {
+                    return;
+                }
+                self.selection_dragging = false;
+                self.dirty = true;
+
+                let computed_timeline_focus = (!self.last_timeline_lines.is_empty())
+                    .then(|| self.timeline_pos_from_mouse(ev.column, ev.row));
+                let mut toggle_target: Option<(usize, Option<usize>)> = None;
+                let mut copied_text: Option<String> = None;
+                let mut clear = false;
+
+                match self.selection.as_mut() {
+                    Some(SelectionState::Timeline {
+                        anchor,
+                        focus,
+                        moved,
+                        pending_toggle,
+                    }) => {
+                        if let Some(pos) = computed_timeline_focus {
+                            *focus = pos;
+                        }
+                        let end_pos = *focus;
+                        let start_pos = *anchor;
+                        let was_moved = *moved;
+                        let pending = *pending_toggle;
+                        *pending_toggle = None;
+
+                        if start_pos != end_pos {
+                            let text = extract_timeline_selection(
+                                &self.last_timeline_lines,
+                                start_pos,
+                                end_pos,
+                            );
+                            if !text.is_empty() {
+                                copied_text = Some(text);
+                            } else {
+                                clear = true;
+                            }
+                        } else {
+                            clear = true;
+                            if !was_moved {
+                                toggle_target = pending;
+                            }
+                        }
+                    }
+                    Some(SelectionState::Screen {
+                        region,
+                        anchor,
+                        focus,
+                        moved,
+                    }) => {
+                        let end_pos = clamp_to_rect(ev.column, ev.row, *region);
+                        *focus = end_pos;
+                        if (*moved || *anchor != end_pos) && *anchor != end_pos {
+                            let text = extract_screen_selection(
+                                &self.last_screen_buf,
+                                *region,
+                                *anchor,
+                                end_pos,
+                            );
+                            if !text.is_empty() {
+                                copied_text = Some(text);
+                            } else {
+                                clear = true;
+                            }
+                        } else {
+                            clear = true;
+                        }
+                    }
+                    None => {}
+                }
+
+                if clear {
+                    self.selection = None;
+                }
+                if let Some(text) = copied_text {
+                    self.copy_to_clipboard(&text, "Copied to clipboard");
+                } else if let Some((item_idx, start_line)) = toggle_target {
+                    self.toggle_item_expanded(item_idx, start_line);
                 }
             }
             MouseEventKind::ScrollUp => {
@@ -3106,6 +4029,11 @@ impl App {
         self.dirty = true;
         if self.modal.is_some() {
             self.handle_modal_key(key);
+            if self.modal.is_none()
+                && matches!(self.selection, Some(SelectionState::Screen { .. }))
+            {
+                self.clear_selection();
+            }
             return;
         }
 
@@ -3113,7 +4041,10 @@ impl App {
         // Global shortcuts
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                if self.completion.is_some() {
+                if let Some(text) = self.selected_text() {
+                    self.copy_to_clipboard(&text, "Copied to clipboard");
+                    self.clear_selection();
+                } else if self.completion.is_some() {
                     self.completion = None;
                 } else if !self.composer.is_empty() {
                     self.composer.clear();
@@ -3135,7 +4066,10 @@ impl App {
                 return;
             }
             KeyCode::Esc => {
-                if self.completion.is_some() {
+                if self.selection.is_some() {
+                    self.clear_selection();
+                    return;
+                } else if self.completion.is_some() {
                     self.completion = None;
                 } else if self.busy {
                     self.cancel_turn();
@@ -3334,6 +4268,7 @@ impl App {
             "model" => !self.model_entries().is_empty() || !agent_has,
             "mode" => !self.mode_entries().is_empty() || !agent_has,
             "thinking" => self.thinking_option().is_some() || !agent_has,
+            "undo" | "rewind" => true,
             _ => LOCAL_COMMANDS.iter().any(|(n, _, _)| *n == name) && !agent_has,
         }
     }
@@ -3561,6 +4496,18 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let ctrl = is_ctrl(&key);
+        if key.code == KeyCode::Esc && self.selection.is_some() {
+            self.clear_selection();
+            return;
+        }
+        if ctrl
+            && key.code == KeyCode::Char('c')
+            && let Some(text) = self.selected_text()
+        {
+            self.copy_to_clipboard(&text, "Copied to clipboard");
+            self.clear_selection();
+            return;
+        }
         let Some(modal) = self.modal.take() else {
             return;
         };
@@ -3681,6 +4628,37 @@ impl App {
                     _ => {}
                 }
                 self.modal = Some(ActiveModal::Sessions(s));
+            }
+            ActiveModal::Rewind(mut r) => {
+                let filtered = r.filtered_indices();
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Char('c') if ctrl => return,
+                    KeyCode::Enter => {
+                        if let Some(&idx) = filtered.get(r.selected) {
+                            let target_idx = r.entries[idx].timeline_idx;
+                            self.rewind_to_turn(target_idx);
+                        }
+                        return;
+                    }
+                    KeyCode::Up => {
+                        r.selected = r
+                            .selected
+                            .checked_sub(1)
+                            .unwrap_or(filtered.len().saturating_sub(1));
+                    }
+                    KeyCode::Down => r.selected = (r.selected + 1) % filtered.len().max(1),
+                    KeyCode::Backspace => {
+                        r.query.pop();
+                        r.selected = 0;
+                    }
+                    KeyCode::Char(c) if !ctrl => {
+                        r.query.push(c);
+                        r.selected = 0;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(ActiveModal::Rewind(r));
             }
             ActiveModal::Config(mut c) => {
                 let n = self.config_options.len();
@@ -4140,4 +5118,232 @@ fn elicitation_field_value(f: &ElicitationField) -> Option<Value> {
             (!vals.is_empty() || !f.required).then_some(Value::Array(vals))
         }
     }
+}
+
+fn clamp_to_rect(x: u16, y: u16, r: Rect) -> (u16, u16) {
+    if r.is_empty() {
+        return (x, y);
+    }
+    let cx = x.clamp(r.x, r.x.saturating_add(r.width).saturating_sub(1));
+    let cy = y.clamp(r.y, r.y.saturating_add(r.height).saturating_sub(1));
+    (cx, cy)
+}
+
+fn extract_timeline_selection(
+    lines: &[String],
+    anchor: TimelinePos,
+    focus: TimelinePos,
+) -> String {
+    if lines.is_empty() || anchor == focus {
+        return String::new();
+    }
+    let (start, end) = if anchor <= focus {
+        (anchor, focus)
+    } else {
+        (focus, anchor)
+    };
+    let last_idx = lines.len().saturating_sub(1);
+    let s_line = start.line.min(last_idx);
+    let e_line = end.line.min(last_idx);
+    let mut out_lines = Vec::with_capacity(e_line - s_line + 1);
+    for line_idx in s_line..=e_line {
+        let text = &lines[line_idx];
+        let col_start = if line_idx == s_line { start.col } else { 0 };
+        let col_end = if line_idx == e_line { end.col } else { usize::MAX };
+        if col_start > col_end {
+            out_lines.push(String::new());
+            continue;
+        }
+        let mut line_out = String::new();
+        let mut cur_w = 0usize;
+        let mut prev_sel = false;
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            let selected = if cw == 0 {
+                prev_sel
+            } else {
+                cur_w <= col_end && cur_w + cw > col_start
+            };
+            prev_sel = selected;
+            if selected {
+                line_out.push(ch);
+            }
+            cur_w += cw;
+        }
+        out_lines.push(line_out.trim_end().to_string());
+    }
+    let joined = out_lines.join("\n");
+    if joined.trim().is_empty() {
+        String::new()
+    } else {
+        joined
+    }
+}
+
+fn extract_screen_selection(
+    buf: &ScreenTextBuffer,
+    region: Rect,
+    anchor: (u16, u16),
+    focus: (u16, u16),
+) -> String {
+    if buf.width == 0 || buf.height == 0 || region.is_empty() || anchor == focus {
+        return String::new();
+    }
+    let a = (anchor.1, anchor.0);
+    let b = (focus.1, focus.0);
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    let r_left = region.x;
+    let r_right = region
+        .x
+        .saturating_add(region.width)
+        .saturating_sub(1)
+        .min(buf.width.saturating_sub(1));
+    let r_top = region.y;
+    let r_bottom = region
+        .y
+        .saturating_add(region.height)
+        .saturating_sub(1)
+        .min(buf.height.saturating_sub(1));
+
+    let mut out_lines = Vec::new();
+    for y in start.0.max(r_top)..=end.0.min(r_bottom) {
+        let x0 = if y == start.0 { start.1.max(r_left) } else { r_left };
+        let x1 = if y == end.0 { end.1.min(r_right) } else { r_right };
+        if x0 > x1 {
+            out_lines.push(String::new());
+            continue;
+        }
+        let mut row_s = String::new();
+        for x in x0..=x1 {
+            let idx = y as usize * buf.width as usize + x as usize;
+            if let Some(Some(sym)) = buf.cells.get(idx) {
+                row_s.push_str(sym);
+            }
+        }
+        out_lines.push(row_s.trim_end().to_string());
+    }
+    let joined = out_lines.join("\n");
+    if joined.trim().is_empty() {
+        String::new()
+    } else {
+        joined
+    }
+}
+
+pub fn compute_turn_tps(
+    gen_duration: Duration,
+    chunk_count: usize,
+    streamed_chars: usize,
+    usage: Option<&Usage>,
+) -> Option<(f64, bool)> {
+    let secs = gen_duration.as_secs_f64();
+    if secs < 0.02 || (chunk_count <= 1 && secs < 0.05) {
+        return None;
+    }
+    if let Some(out) = usage.map(|u| u.output_tokens).filter(|&t| t > 0) {
+        return Some((out as f64 / secs, false));
+    }
+    if streamed_chars > 0 && chunk_count >= 2 {
+        let est_tokens = (streamed_chars as f64 / 4.0).max(1.0);
+        return Some((est_tokens / secs, true));
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn spawn_system_clipboard_copy(text: String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    std::thread::spawn(move || {
+        let run_pipe = |cmd: &str, args: &[&str]| -> bool {
+            let Ok(mut child) = Command::new(cmd)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                return false;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            child.wait().is_ok_and(|s| s.success())
+        };
+
+        if std::env::var_os("TMUX").is_some()
+            && !run_pipe("tmux", &["load-buffer", "-w", "-"])
+        {
+            let _ = run_pipe("tmux", &["load-buffer", "-"]);
+        }
+
+        #[cfg(target_os = "macos")]
+        let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+        #[cfg(target_os = "windows")]
+        let candidates: &[(&str, &[&str])] = &[("clip", &[])];
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let candidates: Vec<(&str, &[&str])> = {
+            let mut v: Vec<(&str, &[&str])> = Vec::new();
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                v.push(("wl-copy", &[]));
+            }
+            if std::env::var_os("DISPLAY").is_some() {
+                v.push(("xclip", &["-selection", "clipboard"]));
+                v.push(("xsel", &["--clipboard", "--input"]));
+            }
+            if std::env::var_os("WSL_DISTRO_NAME").is_some()
+                || std::env::var_os("WSL_INTEROP").is_some()
+            {
+                v.push(("clip.exe", &[]));
+            }
+            v
+        };
+
+        for (cmd, args) in candidates {
+            if run_pipe(cmd, args) {
+                break;
+            }
+        }
+    });
+}
+
+fn normalize_fs_path(raw: &str, default_cwd: &std::path::Path) -> PathBuf {
+    let stripped = raw.strip_prefix("file://").unwrap_or(raw);
+    let p = std::path::Path::new(stripped);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        default_cwd.join(p)
+    }
+}
+
+fn build_rewind_context(timeline: &[TimelineItem]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for item in timeline {
+        match item {
+            TimelineItem::UserMessage { text, .. } => {
+                parts.push(format!("User: {text}"));
+            }
+            TimelineItem::AssistantMessage { text, .. } => {
+                parts.push(format!("Assistant: {text}"));
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n\n");
+    const MAX_CHARS: usize = 24_000;
+    let body = if joined.chars().count() > MAX_CHARS {
+        let skipped = joined.chars().count() - MAX_CHARS;
+        let tail: String = joined.chars().skip(skipped).collect();
+        format!("…\n{tail}")
+    } else {
+        joined
+    };
+    Some(format!(
+        "<conversation_history_before_rewind>\n{body}\n</conversation_history_before_rewind>"
+    ))
 }

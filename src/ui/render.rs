@@ -2,6 +2,7 @@ use crate::acp::terminal_mgr::TerminalSnapshot;
 use crate::acp::client::RpcDirection;
 use crate::app::{App, short_id};
 use crate::state::*;
+use crate::ui::composer::Composer;
 use crate::ui::markdown::{render_markdown, render_unified_diff, strip_ansi, wrap_styled_spans};
 use crate::ui::theme::Theme;
 use ratatui::Frame;
@@ -460,6 +461,54 @@ fn render_item(
                 false,
             )
         }
+        TimelineItem::TurnSummary {
+            duration_ms,
+            gen_duration_ms,
+            output_tokens,
+            total_tokens,
+            tps,
+            tps_estimated,
+        } => {
+            let dur = if *duration_ms < 1000 {
+                format!("{duration_ms}ms")
+            } else {
+                fmt_duration(Duration::from_millis((*duration_ms).min(u64::MAX as u128) as u64))
+            };
+            let gen_dur = if *gen_duration_ms < 1000 {
+                format!("{gen_duration_ms}ms")
+            } else {
+                format!("{:.1}s", *gen_duration_ms as f64 / 1000.0)
+            };
+            let mut spans = vec![Span::styled(
+                format!("✓ Done in {dur}"),
+                Style::default().fg(t.text_dim),
+            )];
+            if let Some(rate) = tps {
+                let prefix = if *tps_estimated { "~" } else { "" };
+                spans.push(Span::styled(" · ", Style::default().fg(t.text_dim)));
+                spans.push(Span::styled(
+                    format!("{prefix}{rate:.1} tok/s"),
+                    Style::default().fg(t.text_muted),
+                ));
+                if let Some(out) = output_tokens {
+                    spans.push(Span::styled(
+                        format!(" ({} out in {gen_dur})", fmt_tokens(*out)),
+                        Style::default().fg(t.text_dim),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        format!(" ({gen_dur} gen)"),
+                        Style::default().fg(t.text_dim),
+                    ));
+                }
+            } else if let Some(tot) = total_tokens {
+                spans.push(Span::styled(
+                    format!(" · {} tokens", fmt_tokens(*tot)),
+                    Style::default().fg(t.text_dim),
+                ));
+            }
+            (vec![Line::from(spans)], false)
+        }
     }
 }
 
@@ -903,6 +952,10 @@ fn build_timeline(app: &mut App, width: u16) -> (Vec<Line<'static>>, Vec<Timelin
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.timeline_hit.view_rect = Rect::default();
+    app.timeline_hit.inner_rect = Rect::default();
+    app.timeline_hit.sidebar_rect = None;
+    app.timeline_hit.composer_rect = None;
+    app.timeline_hit.modal_rect = None;
     app.timeline_hit.activity_rect = Rect::default();
     app.timeline_hit.jump_pill_rect = None;
     app.timeline_hit.completion_rect = None;
@@ -913,7 +966,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     render(f, Block::default().style(Style::default().bg(t.bg).fg(t.text)), area);
 
     let composer_inner_w = area.width.saturating_sub(4).max(10) as usize;
-    let (comp_rows, comp_cursor) = wrap_composer(&app.composer.lines, app.composer.row, app.composer.col, composer_inner_w);
+    let (comp_rows, comp_cursor) = wrap_composer(&app.composer, composer_inner_w, &t);
     let comp_h = (comp_rows.len().clamp(1, 10) as u16) + 2;
 
     let queue_h = app.queued.len().min(3) as u16;
@@ -955,6 +1008,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.timeline_hit.toast_rects = draw_toasts(f, app, rows[1]);
     if app.modal.is_some() {
         draw_modal(f, app, area);
+    }
+
+    capture_screen_text(f.buffer_mut(), &mut app.last_screen_buf);
+    if let Some(SelectionState::Screen {
+        region,
+        anchor,
+        focus,
+        moved,
+    }) = &app.selection
+        && (*moved || anchor != focus)
+    {
+        highlight_screen_selection(f.buffer_mut(), *region, *anchor, *focus, t.selection_bg);
     }
 }
 
@@ -1001,6 +1066,130 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+}
+
+fn highlight_line_selection(
+    line: Line<'static>,
+    col_start: usize,
+    col_end_inclusive: usize,
+    full_line_to_end: bool,
+    sel_bg: Color,
+) -> Line<'static> {
+    if col_start > col_end_inclusive {
+        return line;
+    }
+    let plain_len_trimmed = line_plain_text(&line).trim_end().width();
+    let effective_end = if full_line_to_end {
+        plain_len_trimmed.saturating_sub(1)
+    } else {
+        col_end_inclusive
+    };
+    if full_line_to_end && plain_len_trimmed == 0 && col_start == 0 {
+        return Line::from(Span::styled(" ", Style::default().bg(sel_bg)));
+    }
+    if col_start > effective_end {
+        return line;
+    }
+
+    let mut out_spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut cur_w = 0usize;
+    let mut prev_sel = false;
+
+    for span in line.spans {
+        let base_style = span.style;
+        let mut buf = String::new();
+        let mut buf_sel: Option<bool> = None;
+
+        for ch in span.content.chars() {
+            let cw = ch.width().unwrap_or(0);
+            let selected = if cw == 0 {
+                prev_sel
+            } else {
+                cur_w <= effective_end && cur_w + cw > col_start
+            };
+            prev_sel = selected;
+            if buf_sel.is_some_and(|s| s != selected) {
+                let st = if buf_sel == Some(true) {
+                    base_style.bg(sel_bg)
+                } else {
+                    base_style
+                };
+                out_spans.push(Span::styled(std::mem::take(&mut buf), st));
+            }
+            buf_sel = Some(selected);
+            buf.push(ch);
+            cur_w += cw;
+        }
+
+        if !buf.is_empty() {
+            let st = if buf_sel == Some(true) {
+                base_style.bg(sel_bg)
+            } else {
+                base_style
+            };
+            out_spans.push(Span::styled(buf, st));
+        }
+    }
+
+    Line::from(out_spans).style(line.style)
+}
+
+fn capture_screen_text(buf: &ratatui::buffer::Buffer, out: &mut ScreenTextBuffer) {
+    let w = buf.area.width;
+    let h = buf.area.height;
+    out.width = w;
+    out.height = h;
+    let total = w as usize * h as usize;
+    out.cells.clear();
+    out.cells.reserve(total);
+    for y in buf.area.y..buf.area.y.saturating_add(h) {
+        for x in buf.area.x..buf.area.x.saturating_add(w) {
+            let cell = &buf[(x, y)];
+            if cell.skip {
+                out.cells.push(None);
+            } else {
+                out.cells.push(Some(cell.symbol().to_string()));
+            }
+        }
+    }
+}
+
+fn highlight_screen_selection(
+    buf: &mut ratatui::buffer::Buffer,
+    region: Rect,
+    anchor: (u16, u16),
+    focus: (u16, u16),
+    sel_bg: Color,
+) {
+    let region = region.intersection(buf.area);
+    if region.is_empty() {
+        return;
+    }
+    let a = (anchor.1, anchor.0);
+    let b = (focus.1, focus.0);
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    let r_left = region.x;
+    let r_right = region.x.saturating_add(region.width).saturating_sub(1);
+    let r_top = region.y;
+    let r_bottom = region.y.saturating_add(region.height).saturating_sub(1);
+
+    for y in start.0.max(r_top)..=end.0.min(r_bottom) {
+        let x0 = if y == start.0 { start.1.max(r_left) } else { r_left };
+        let x1 = if y == end.0 { end.1.min(r_right) } else { r_right };
+        if x0 > x1 {
+            continue;
+        }
+        for x in x0..=x1 {
+            buf[(x, y)].set_bg(sel_bg);
+        }
+    }
+}
+
 fn draw_timeline(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = area.inner(Margin { horizontal: 2, vertical: 0 });
     let content_w = inner.width.saturating_sub(1).max(10);
@@ -1033,10 +1222,40 @@ fn draw_timeline(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.last_total_lines = total;
     app.last_timeline_height = height;
+    app.last_timeline_lines = lines.iter().map(line_plain_text).collect();
 
     let start = total.saturating_sub(height + app.scroll_from_bottom);
     let end = (start + height).min(total);
-    let visible: Vec<Line<'static>> = lines[start..end].to_vec();
+    let timeline_sel = match &app.selection {
+        Some(SelectionState::Timeline {
+            anchor,
+            focus,
+            moved,
+            ..
+        }) if *moved || anchor != focus => {
+            Some(if anchor <= focus { (*anchor, *focus) } else { (*focus, *anchor) })
+        }
+        _ => None,
+    };
+    let sel_bg = app.theme.selection_bg;
+    let visible: Vec<Line<'static>> = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let l = line.clone();
+            if let Some((s, e)) = timeline_sel {
+                let line_idx = start + offset;
+                if line_idx >= s.line && line_idx <= e.line {
+                    let col_start = if line_idx == s.line { s.col } else { 0 };
+                    let full_to_end = line_idx < e.line;
+                    let col_end = if full_to_end { usize::MAX } else { e.col };
+                    return highlight_line_selection(l, col_start, col_end, full_to_end, sel_bg);
+                }
+            }
+            l
+        })
+        .collect();
+    let inner_rect = Rect { width: content_w, ..inner }.intersection(f.area());
     render(f, Paragraph::new(visible), Rect { width: content_w, ..inner });
 
     let has_scrollbar = total > height;
@@ -1045,6 +1264,7 @@ fn draw_timeline(f: &mut Frame, app: &mut App, area: Rect) {
         ..area
     }
     .intersection(f.area());
+    app.timeline_hit.inner_rect = inner_rect;
     app.timeline_hit.inner_y = inner.y;
     app.timeline_hit.visible_start = start;
     app.timeline_hit.spans = spans;
@@ -1098,7 +1318,7 @@ fn kv(k: &str, v: String, w: usize, t: &Theme, vcolor: Color) -> Line<'static> {
     ])
 }
 
-fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
+fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let t = &app.theme;
     let block = Block::default()
         .borders(Borders::LEFT)
@@ -1106,6 +1326,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(t.panel));
     let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 1 });
     render(f, block, area);
+    app.timeline_hit.sidebar_rect = Some(inner.intersection(f.area()));
     let w = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -1346,6 +1567,10 @@ fn draw_activity(f: &mut Frame, app: &App, area: Rect, sidebar_visible: bool) {
         spans.push(Span::styled("Disconnected — ctrl+p → Reconnect", Style::default().fg(t.error)));
     } else if let Some(d) = app.last_turn_duration {
         let mut s = format!("✓ Done in {}", fmt_duration(d));
+        if let Some((tps, est)) = app.last_turn_tps {
+            let prefix = if est { "~" } else { "" };
+            s.push_str(&format!(" · {prefix}{tps:.1} tok/s"));
+        }
         if let Some(u) = &app.usage.last_turn_usage {
             s.push_str(&format!(" · {} tokens", fmt_tokens(u.total_tokens)));
         }
@@ -1373,45 +1598,83 @@ fn draw_activity(f: &mut Frame, app: &App, area: Rect, sidebar_visible: bool) {
     render(f, Paragraph::new(Line::from(spans)), area);
 }
 
-/// Wrap composer lines to `width` columns and return the visual rows plus the cursor's (row, col).
-fn wrap_composer(lines: &[String], row: usize, col: usize, width: usize) -> (Vec<String>, (usize, usize)) {
-    let mut rows = Vec::new();
+/// Wrap composer lines to `width` columns and return the visual rows (segments of `(text, is_paste_pill)`)
+/// plus the cursor's `(row, col)`.
+fn wrap_composer(
+    composer: &Composer,
+    width: usize,
+    _theme: &Theme,
+) -> (Vec<Vec<(String, bool)>>, (usize, usize)) {
+    let mut rows: Vec<Vec<(String, bool)>> = Vec::new();
     let mut cursor = (0, 0);
-    for (li, line) in lines.iter().enumerate() {
-        let mut cur = String::new();
-        let mut cur_w = 0;
-        let start_row = rows.len();
+    for (li, line) in composer.lines.iter().enumerate() {
+        let mut cur_spans: Vec<(String, bool)> = Vec::new();
+        let mut cur_text = String::new();
+        let mut cur_w = 0usize;
         let mut found = false;
         for (bi, ch) in line.char_indices() {
-            if li == row && bi == col && !found {
+            if li == composer.row && bi == composer.col && !found {
                 cursor = (rows.len(), cur_w);
                 found = true;
             }
-            let cw = ch.width().unwrap_or(0);
-            if cur_w + cw > width {
-                rows.push(std::mem::take(&mut cur));
-                cur_w = 0;
-                if li == row && bi == col {
-                    cursor = (rows.len(), 0);
+            if let Some(label) = composer.paste_label(ch) {
+                let cw = label.width();
+                if cur_w > 0 && cur_w + cw > width {
+                    if !cur_text.is_empty() {
+                        cur_spans.push((std::mem::take(&mut cur_text), false));
+                    }
+                    rows.push(std::mem::take(&mut cur_spans));
+                    cur_w = 0;
+                    if li == composer.row && bi == composer.col {
+                        cursor = (rows.len(), 0);
+                    }
                 }
+                if !cur_text.is_empty() {
+                    cur_spans.push((std::mem::take(&mut cur_text), false));
+                }
+                cur_spans.push((label.to_string(), true));
+                cur_w += cw;
+            } else {
+                let cw = ch.width().unwrap_or(0);
+                if cur_w + cw > width {
+                    if !cur_text.is_empty() {
+                        cur_spans.push((std::mem::take(&mut cur_text), false));
+                    }
+                    rows.push(std::mem::take(&mut cur_spans));
+                    cur_w = 0;
+                    if li == composer.row && bi == composer.col {
+                        cursor = (rows.len(), 0);
+                    }
+                }
+                cur_text.push(ch);
+                cur_w += cw;
             }
-            cur.push(ch);
-            cur_w += cw;
         }
-        if li == row && !found {
+        if li == composer.row && !found {
             if cur_w >= width {
-                rows.push(std::mem::take(&mut cur));
+                if !cur_text.is_empty() {
+                    cur_spans.push((std::mem::take(&mut cur_text), false));
+                }
+                rows.push(std::mem::take(&mut cur_spans));
                 cur_w = 0;
             }
             cursor = (rows.len(), cur_w);
         }
-        rows.push(cur);
-        let _ = start_row;
+        if !cur_text.is_empty() {
+            cur_spans.push((cur_text, false));
+        }
+        rows.push(cur_spans);
     }
     (rows, cursor)
 }
 
-fn draw_composer(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: (usize, usize)) {
+fn draw_composer(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    rows: &[Vec<(String, bool)>],
+    cursor: (usize, usize),
+) {
     let t = &app.theme;
     let mode_id = app.current_mode_id().unwrap_or_default();
     let mode_color = t.mode_color(&mode_id);
@@ -1447,6 +1710,7 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: 
         width: inner.width.saturating_sub(2),
         ..inner
     };
+    app.timeline_hit.composer_rect = Some(text_area.intersection(f.area()));
     render(f, Paragraph::new(Span::styled("›", prompt_style)), Rect { width: 2, height: inner.height.min(1), ..inner });
 
     if app.composer.is_empty() {
@@ -1468,17 +1732,40 @@ fn draw_composer(f: &mut Frame, app: &App, area: Rect, rows: &[String], cursor: 
             text_area,
         );
     } else {
+        let is_single_slash = rows.len() == 1
+            && app
+                .composer
+                .lines
+                .first()
+                .is_some_and(|l| l.trim_start().starts_with('/'));
+        let text_style = if is_single_slash {
+            Style::default().fg(t.accent)
+        } else {
+            Style::default().fg(t.text)
+        };
+        let pill_style = Style::default()
+            .fg(t.accent)
+            .bg(t.selection_bg)
+            .add_modifier(Modifier::BOLD);
         let visible: Vec<Line<'static>> = rows
             .iter()
             .skip(scroll)
             .take(height)
-            .map(|r| {
-                let style = if r.trim_start().starts_with('/') && rows.len() == 1 {
-                    Style::default().fg(t.accent)
+            .map(|segs| {
+                if segs.is_empty() {
+                    Line::raw("")
                 } else {
-                    Style::default().fg(t.text)
-                };
-                Line::from(Span::styled(r.clone(), style))
+                    Line::from(
+                        segs.iter()
+                            .map(|(txt, is_pill)| {
+                                Span::styled(
+                                    txt.clone(),
+                                    if *is_pill { pill_style } else { text_style },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
             })
             .collect();
         render(f, Paragraph::new(visible), text_area);
@@ -1820,6 +2107,50 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
             }
             render(f, Paragraph::new(lines), inner);
         }
+        Some(ActiveModal::Rewind(r_state)) => {
+            let r = centered(area, 92, 24);
+            render(f, Clear, r);
+            let block = modal_block("Rewind to message", "type to filter · ↑↓ select · enter rewind & edit · esc close", &t);
+            let inner = block.inner(r);
+            render(f, block, r);
+            let filtered = r_state.filtered_indices();
+            let mut lines = vec![query_line(&r_state.query, "Filter messages…", &t), Line::raw("")];
+            let iw = inner.width as usize;
+            if filtered.is_empty() {
+                lines.push(Line::from(Span::styled("  No matching messages", Style::default().fg(t.text_dim))));
+            }
+            let h = (inner.height.saturating_sub(2) / 2) as usize;
+            let start = list_window(r_state.selected, filtered.len(), h);
+            for (pos, &idx) in filtered.iter().enumerate().skip(start).take(h) {
+                let entry = &r_state.entries[idx];
+                let sel = pos == r_state.selected;
+                let bg = if sel { t.selection_bg } else { t.surface };
+                let when = entry.timestamp.format("%H:%M").to_string();
+                let turn_word = if entry.turns_removed == 1 { "turn" } else { "turns" };
+                let meta = if entry.files_affected > 0 {
+                    let file_word = if entry.files_affected == 1 { "file" } else { "files" };
+                    format!("   {} · reverts {} {} · {} {}", when, entry.turns_removed, turn_word, entry.files_affected, file_word)
+                } else {
+                    format!("   {} · reverts {} {}", when, entry.turns_removed, turn_word)
+                };
+                let preview = entry.text.replace('\n', " ⏎ ");
+                let l1 = Line::from(vec![
+                    Span::styled(if sel { " ❯ " } else { "   " }, Style::default().fg(t.primary)),
+                    Span::styled(
+                        truncate_w(&preview, iw.saturating_sub(4)),
+                        Style::default().fg(if sel { t.primary } else { t.text }).add_modifier(Modifier::BOLD),
+                    ),
+                ]);
+                let l2 = Line::from(Span::styled(
+                    truncate_w(&meta, iw),
+                    Style::default().fg(t.text_dim),
+                ));
+                lines.push(pad_bg(l1, iw, bg));
+                lines.push(pad_bg(l2, iw, bg));
+            }
+            render(f, Paragraph::new(lines), inner);
+            app.timeline_hit.modal_rect = Some(inner.intersection(f.area()));
+        }
         Some(ActiveModal::Config(c)) => {
             let n = app.config_options.len().min(26) as u16;
             let r = centered(area, 80, (n + 6).clamp(8, 26));
@@ -1850,6 +2181,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             render(f, Paragraph::new(lines), inner);
+            app.timeline_hit.modal_rect = Some(inner.intersection(f.area()));
         }
         Some(ActiveModal::Permission(_)) => draw_permission(f, app, area),
         Some(ActiveModal::Elicitation(_)) => draw_elicitation(f, app, area),
@@ -1890,6 +2222,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
                 ]));
             }
             render(f, Paragraph::new(lines), inner);
+            app.timeline_hit.modal_rect = Some(inner.intersection(f.area()));
         }
         Some(ActiveModal::Help(_)) => draw_help(f, app, area),
         None => {}
@@ -1916,6 +2249,7 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
         ("ctrl+g", "Switch the ACP agent"),
         ("ctrl+n", "New session"),
         ("ctrl+s", "Browse and resume sessions"),
+        ("/undo · /rewind", "Undo last turn or rewind to an earlier message to edit it"),
     ]),
     ("View", &[
         ("ctrl+p", "Command palette"),
@@ -2053,6 +2387,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
         inner
     };
     render(f, Paragraph::new(visible), text_area);
+    app.timeline_hit.modal_rect = Some(text_area.intersection(f.area()));
 
     if total > ih && inner.width > 0 && inner.height > 0 {
         let mut state = ScrollbarState::new(max_scroll).position(h.scroll);
@@ -2069,7 +2404,7 @@ fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn draw_permission(f: &mut Frame, app: &App, area: Rect) {
+fn draw_permission(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(ActiveModal::Permission(p)) = app.modal.as_ref() else {
         return;
     };
@@ -2195,9 +2530,10 @@ fn draw_permission(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(r).inner(Margin { horizontal: 1, vertical: 0 });
     render(f, block, r);
     render(f, Paragraph::new(body), inner);
+    app.timeline_hit.modal_rect = Some(inner.intersection(f.area()));
 }
 
-fn draw_elicitation(f: &mut Frame, app: &App, area: Rect) {
+fn draw_elicitation(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(ActiveModal::Elicitation(e)) = app.modal.as_ref() else {
         return;
     };
@@ -2287,6 +2623,7 @@ fn draw_elicitation(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(r).inner(Margin { horizontal: 1, vertical: 0 });
     render(f, block, r);
     render(f, Paragraph::new(body), inner);
+    app.timeline_hit.modal_rect = Some(inner.intersection(f.area()));
     if let Some((row, col)) = cursor
         && row < inner.height
     {
