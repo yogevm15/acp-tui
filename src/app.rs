@@ -210,6 +210,8 @@ pub struct App {
     pub show_thoughts: bool,
     pub expand_tools: bool,
     pub auto_approve: bool,
+    /// The terminal reports modifiers on Enter (kitty keyboard protocol); without it shift+enter is plain enter.
+    pub keyboard_enhanced: bool,
     pub should_quit: bool,
     pub quit_armed_at: Option<Instant>,
     pub esc_armed_at: Option<Instant>,
@@ -478,6 +480,7 @@ impl App {
             show_thoughts,
             expand_tools,
             auto_approve,
+            keyboard_enhanced: false,
             should_quit: false,
             quit_armed_at: None,
             esc_armed_at: None,
@@ -1087,6 +1090,11 @@ impl App {
             return Some(opt.current_str());
         }
         self.modes.as_ref().map(|m| m.current_mode_id.clone())
+    }
+
+    /// Newline key to advertise in hints: one this terminal can actually distinguish from enter.
+    pub fn newline_key(&self) -> &'static str {
+        if self.keyboard_enhanced { "shift+enter" } else { "ctrl+j" }
     }
 
     pub fn current_mode_label(&self) -> Option<String> {

@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
     app.connect(Some(initial_action));
 
     let keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+    app.keyboard_enhanced = keyboard_enhanced;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         leave_tui(keyboard_enhanced);

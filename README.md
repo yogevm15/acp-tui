@@ -149,13 +149,19 @@ Type `@` to fuzzy-search workspace files (respecting `.gitignore`):
 | Shortcut | Action |
 | --- | --- |
 | `Enter` | Send prompt (steer or queue while agent is busy) |
-| `Shift+Enter` · `Alt+Enter` · `Ctrl+J` · `\`+`Enter` | Insert newline |
+| `Ctrl+J` · `\`+`Enter` · `Shift+Enter` · `Alt+Enter` | Insert newline |
 | `Up` / `Down` | Browse prompt history (or edit last queued message when input is empty) |
 | `Ctrl+A` / `Ctrl+E` | Move to start / end of line |
 | `Ctrl+Left` / `Ctrl+Right` · `Alt+B` / `Alt+F` | Move by word |
 | `Ctrl+W` · `Alt+D` · `Ctrl+U` · `Ctrl+K` | Delete word back · word forward · to line start · to line end |
 | `Ctrl+Z` | Undo |
 | `Ctrl+R` | Search prompt history |
+
+`Shift+Enter` only works in terminals that support the kitty keyboard protocol (Ghostty, kitty, WezTerm, iTerm2 with
+"Report keys using CSI u", Alacritty, foot). macOS Terminal.app sends the same byte for `Shift+Enter` and `Enter`, so
+there it submits; use `Ctrl+J` or end the line with `\` instead. `Option+Enter` also works in Terminal.app once
+Settings → Profiles → Keyboard → "Use Option as Meta key" is enabled. The composer hint shows the key that works in
+the current terminal.
 
 ### Agent, View & App
 

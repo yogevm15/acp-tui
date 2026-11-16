@@ -860,8 +860,9 @@ fn welcome_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         ),
     ]));
     lines.push(Line::raw(""));
+    let send_tip = format!("send · {} or \\ for a new line", app.newline_key());
     let tips: [(&str, &str); 8] = [
-        ("enter", "send · shift+enter or \\ for a new line"),
+        ("enter", &send_tip),
         ("/", "commands · /model, /mode, /agent complete their values"),
         ("@", "attach a file (fuzzy search)"),
         ("shift+tab", "cycle the session mode"),
@@ -1688,9 +1689,9 @@ fn draw_composer(
         title.push(Span::styled("⚠ auto-approve ", Style::default().fg(t.warning)));
     }
     let hint = if app.busy {
-        " enter: steer/queue · esc: interrupt "
+        " enter: steer/queue · esc: interrupt ".to_string()
     } else {
-        " enter send · shift+enter newline "
+        format!(" enter send · {} newline ", app.newline_key())
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2232,7 +2233,7 @@ fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
 const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     ("Composer", &[
         ("enter", "Send the message (steer or queue while the agent works)"),
-        ("shift+enter · alt+enter · ctrl+j", "New line (or end the line with \\)"),
+        ("ctrl+j · shift+enter · alt+enter", "New line (or end the line with \\); shift+enter needs a terminal that reports it, not macOS Terminal.app"),
         ("↑ / ↓", "Prompt history · edit the last queued message"),
         ("ctrl+a / ctrl+e", "Start / end of the line"),
         ("ctrl+← / ctrl+→ · alt+b / alt+f", "Previous / next word"),
